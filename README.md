@@ -49,7 +49,7 @@ Reference videos (the plate) are always sliced per window and cropped per tile, 
 
 ## Tips
 
-- Load the plate at **24 fps**, H3's native rate.
+- Load the plate
 - Write the prompt as true for **every** frame, because each window reads it on its own.
 - If you see a seam where windows join, increase `overlap_frames` (22 → 39).
 
