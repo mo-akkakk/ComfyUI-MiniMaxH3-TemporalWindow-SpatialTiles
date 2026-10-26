@@ -104,7 +104,7 @@ def run(model, pos, lat, sigmas, seed=3):
 
 
 def patch(model, clip, frames=124, overlap=22, tiles=False, tw=960, th=544, tov=256):
-    return pack.MiniMaxH3TemporalWindow.execute(model, frames, overlap, True, tiles, tw, th, tov, True, clip=clip).result
+    return pack.MiniMaxH3TemporalWindow.execute(model, frames > 0, max(frames, 22), overlap, True, tiles, tw, th, tov, True, clip=clip).result
 
 
 def test_plans():
@@ -115,6 +115,18 @@ def test_plans():
         ok &= all(s % 5 == 0 and (n - 2) % 5 == 0 for s, n in w)
         ok &= all(w[i][0] + w[i][1] - w[i + 1][0] >= hw.tokens_for_frames(22) for i in range(len(w) - 1))
         check("window plan {} frames -> {}".format(frames, [(hw.frames_for_tokens(s), hw.frames_for_tokens(n)) for s, n in w]), ok)
+
+
+def test_switch_off_is_native(model):
+    W, H, N = 384, 256, 209
+    plate, ref = torch.rand(N, H, W, 3), torch.rand(1, H, W, 3)
+    sigmas = comfy.samplers.calculate_sigmas(model.get_model_object("model_sampling"), "simple", 1)
+    pos, lat = conditioning(FakeClip(), plate, ref, W, H, N)
+    native = run(model, pos, lat, sigmas)[0]["samples"].unbind()
+    m, c = patch(model, FakeClip(), frames=0)
+    pos2, lat2 = conditioning(c, plate, ref, W, H, N)
+    mine = run(m, pos2, lat2, sigmas)[0]["samples"].unbind()
+    check("temporal_windows off: whole length in one native pass", torch.equal(native[0], mine[0]) and torch.equal(native[1], mine[1]))
 
 
 def test_one_window_is_native(model):
@@ -228,6 +240,7 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as d:
         model = tiny_model(os.path.join(d, "tiny_h3.safetensors"))
         test_one_window_is_native(model)
+        test_switch_off_is_native(model)
         test_windows(model)
         test_ksampler(model)
         test_stage2_tiles(model)

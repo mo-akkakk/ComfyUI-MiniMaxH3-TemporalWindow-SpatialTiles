@@ -48,7 +48,7 @@ def audio_ticks(frames):
 def plan_windows(latent_t, window_frames, overlap_frames):
     """[(start, length)] in latent tokens. Clip-aligned; the last window is pulled back to end on the last frame."""
     win = tokens_for_frames(window_frames)
-    if win >= latent_t:
+    if window_frames <= 0 or win >= latent_t:
         return [(0, latent_t)]
     ov = min(tokens_for_frames(overlap_frames), win - CLIP_TOKENS)
     windows = [(0, win)]

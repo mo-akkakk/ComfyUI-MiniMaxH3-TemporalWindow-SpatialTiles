@@ -20,6 +20,8 @@ class MiniMaxH3TemporalWindow(io.ComfyNode):
                 io.Clip.Input("clip", optional=True,
                               tooltip="Route the CLIP through here into Reference to Video so each window re-encodes the prompt with only "
                                       "its own slice of <Video N> (timestamps from 0), like a manual batch. Strongly recommended."),
+                io.Boolean.Input("temporal_windows", default=True,
+                                 tooltip="Split the shot into overlapping temporal windows. Off = the whole length runs as one native H3 pass."),
                 io.Int.Input("window_frames", default=124, min=22, max=3600, step=17,
                              tooltip="Frames per window (17k+5). Keep it inside what works natively for you, e.g. <= 192."),
                 io.Int.Input("overlap_frames", default=22, min=5, max=1000, step=17,
@@ -38,9 +40,9 @@ class MiniMaxH3TemporalWindow(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, window_frames, overlap_frames, carry_overlap, spatial_tiles, tile_width, tile_height,
+    def execute(cls, model, temporal_windows, window_frames, overlap_frames, carry_overlap, spatial_tiles, tile_width, tile_height,
                 tile_overlap, crop_ref_images_per_tile, clip=None) -> io.NodeOutput:
-        wrapper = WindowsWrapper(window_frames, overlap_frames, carry_overlap,
+        wrapper = WindowsWrapper(window_frames if temporal_windows else 0, overlap_frames, carry_overlap,
                                  tile_height // 16 if spatial_tiles else 0, tile_width // 16 if spatial_tiles else 0,
                                  tile_overlap // 16, crop_ref_images_per_tile)
         return io.NodeOutput(apply(model, wrapper), recording_clip(clip) if clip is not None else None)
