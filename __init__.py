@@ -14,7 +14,7 @@ class MiniMaxH3TemporalWindow(io.ComfyNode):
             description="Put after the model, and route the CLIP through it into Reference to Video. "
                         "Samples the video as overlapping temporal windows, one after another: each window is a normal H3 run on its "
                         "slice of the plate, starts from the previous window's finished overlap frames (frame-0 guide), and the "
-                        "overlap is crossfaded. Optional spatial tiles for a stage-2 refine. Works with KSampler and SamplerCustomAdvanced.",
+                        "overlap is crossfaded. Optional spatial tiles, each following its crop of the plate. Works with KSampler and SamplerCustomAdvanced.",
             inputs=[
                 io.Model.Input("model"),
                 io.Clip.Input("clip", optional=True,
@@ -29,7 +29,7 @@ class MiniMaxH3TemporalWindow(io.ComfyNode):
                 io.Boolean.Input("carry_overlap", default=True,
                                  tooltip="Give each window the previous window's finished overlap frames (video and audio) as its frame-0 guide."),
                 io.Boolean.Input("spatial_tiles", default=False,
-                                 tooltip="Stage 2 only (refining an upscaled latent with partial sigmas). Never for a full-denoise first pass."),
+                                 tooltip="Split each window into overlapping tiles, for stage 1 or stage 2. Each tile follows its crop of the plate. Without a reference video, a full-denoise pass in tiles repeats the subject."),
                 io.Int.Input("tile_width", default=960, min=256, max=16384, step=32),
                 io.Int.Input("tile_height", default=544, min=256, max=16384, step=32),
                 io.Int.Input("tile_overlap", default=256, min=0, max=8192, step=32),

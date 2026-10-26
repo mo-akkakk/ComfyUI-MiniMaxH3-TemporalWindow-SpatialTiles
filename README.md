@@ -5,7 +5,7 @@ by Mohamed ([mo-akkakk](https://registry.comfy.org/publishers/mo-akkakk))
 Long video-to-video for the **open-weights MiniMax H3** in native ComfyUI. It is one node that goes after the model.
 
 - **Temporal windows (stage 1 and stage 2).** The shot is sampled as overlapping windows, **one after another**. Each window is an ordinary native H3 run on its own slice of the plate. It starts from the previous window's finished overlap frames, video and audio, which are given to it as a frame-0 guide. The overlap is then crossfaded. This keeps every window inside the length where H3 tracks the plate accurately, while the result runs as long as you like.
-- **Spatial tiles (stage 2 only).** When refining an upscaled latent with partial sigmas, each window is split into overlapping tiles. Each tile runs on its crop of the plate, and the tiles are feather-blended.
+- **Spatial tiles (stage 1 and stage 2).** Each window can be split into overlapping tiles. Each tile runs on its own crop of the plate, with the prompt re-encoded for that crop, and the tiles are feather-blended. This works for a full-denoise first pass as well as a stage-2 refine, because every tile is anchored to its region of the plate.
 
 Nothing inside the model is patched, and every window and tile goes through the native H3 conditioning and sampling code. With a single window and no tiles, the output is bit-identical to the plain native workflow.
 
@@ -29,27 +29,27 @@ CLIPLoader ------------------------------------> (clip in ... clip out) -> MiniM
 
 Everything else is the stock H3 workflow: Reference to Video, Add Guide, SamplerCustomAdvanced or KSampler, and VAE Decode.
 
-- **Stage 1:** full sigmas, `spatial_tiles` off.
-- **Stage 2:** decode → upscale → VAE Encode → Concat AV Latent (with the stage-1 audio). Then use a second copy of the node with `spatial_tiles` on, and sample with the low part of SplitSigmas.
+- **Stage 1:** full sigmas. Turn `spatial_tiles` on when the frame is bigger than what H3 handles well on your setup.
+- **Stage 2:** decode → upscale → VAE Encode → Concat AV Latent (with the stage-1 audio). Then use a second copy of the node, usually with `spatial_tiles` on, and sample with the low part of SplitSigmas.
 
-**Route the CLIP through the node.** It records what Reference to Video encodes and re-encodes the prompt per window, and per tile in stage 2. Qwen then sees only that window's frames of `<Video N>`, with timestamps from 0, exactly like a manually cut batch. Without this, every window reads a description of the whole shot, and timing drifts.
+**Route the CLIP through the node.** It records what Reference to Video encodes and re-encodes the prompt per window, and per tile. Qwen then sees only that window's frames of `<Video N>`, with timestamps from 0, exactly like a manually cut batch. Without this, every window reads a description of the whole shot, and timing drifts.
 
 ## Settings
 
 | Input | Meaning |
 |---|---|
+| `temporal_windows` | Split the shot into overlapping windows. Off = the whole length runs as one pass. |
 | `window_frames` | Frames per window, on H3's 17k+5 grid (124 = 5.2 s, 175 = 7.3 s). Keep it within what H3 handles accurately on your setup. |
 | `overlap_frames` | Frames shared by neighbouring windows (5, 22, 39…). They are carried into the next window as its frame-0 guide, then crossfaded. The last window is pulled back to end on the last frame, so its overlap can be larger. |
 | `carry_overlap` | Carry the finished overlap (video and audio) into the next window. |
-| `spatial_tiles` | Stage 2 only. A full-denoise pass in tiles repeats the subject in every tile. |
-| `tile_width` / `tile_height` / `tile_overlap` | Tile size in pixels. Use roughly the stage-1 resolution, with ≥ 192 px overlap. |
+| `spatial_tiles` | Split each window into overlapping tiles (stage 1 or stage 2). Needs a plate: without a reference video, a full-denoise pass in tiles repeats the subject in every tile. |
+| `tile_width` / `tile_height` / `tile_overlap` | Tile size in pixels. Use a size H3 handles well on your setup, with ≥ 192 px overlap. |
 | `crop_ref_images_per_tile` | Crop `<Picture N>` to each tile as well. Turn it on when the picture is a frame of the shot (e.g. an edited first frame). Turn it off for character, product or style references. |
 
 Reference videos (the plate) are always sliced per window and cropped per tile, because they are frame-aligned with the output. Frame guides from Add Guide go only into the window that contains their frame.
 
 ## Tips
 
-- Load the plate
 - Write the prompt as true for **every** frame, because each window reads it on its own.
 - If you see a seam where windows join, increase `overlap_frames` (22 → 39).
 
@@ -78,16 +78,16 @@ Run this from the ComfyUI root. The tests run ComfyUI's real H3 conditioning, mo
 - the overlap carry is correct;
 - the per-window prompt shows only that window's frames, with timestamps from 0;
 - it works through KSampler;
-- stage-2 tiles work with partial sigmas.
+- tiles work with full and partial sigmas.
 
 ## Limits
 
-- Stage-2 tiles are sampled independently and blended afterwards. A strong refine can show differences between tiles, so lighter sigmas and a wider overlap help.
-- In stage 2 each tile renders its own soundtrack and the node averages them. Keep the stage-1 audio for the final file.
+- Tiles are sampled independently and blended afterwards, so flat areas (sky, walls) can show slight differences between tiles. A wider `tile_overlap` helps.
+- Each tile renders its own soundtrack and the node averages them. For tiled runs, take the audio from an untiled pass or the source.
 - Batch size 1, the same as native H3.
 
 ## License
 
 MIT, © 2026 Mohamed ([mo-akkakk](https://registry.comfy.org/publishers/mo-akkakk)).
 
-   ![Minimax H3 Temporal Window & Spatial Tiles node](node.png)
+![Minimax H3 Temporal Window & Spatial Tiles node](node.png)

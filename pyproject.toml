@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-minimax-h3-temporal-window-spatial-tiles"
-description = "Minimax H3 Temporal Window & Spatial Tiles: long video-to-video for the open-weights MiniMax H3 as overlapping temporal windows sampled one after another (stage 1 and 2), plus spatial tiles for a stage-2 refine. One model patch, works with native ComfyUI H3 nodes."
-version = "1.0.1"
+description = "Minimax H3 Temporal Window & Spatial Tiles: long video-to-video for the open-weights MiniMax H3 as overlapping temporal windows sampled one after another (stage 1 and 2), plus spatial tiles that follow their crop of the plate. One model patch, works with native ComfyUI H3 nodes."
+version = "1.0.2"
 license = { file = "LICENSE" }
 dependencies = []
 
