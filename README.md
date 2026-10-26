@@ -89,3 +89,5 @@ Run this from the ComfyUI root. The tests run ComfyUI's real H3 conditioning, mo
 ## License
 
 MIT, © 2026 Mohamed ([mo-akkakk](https://registry.comfy.org/publishers/mo-akkakk)).
+
+   ![Minimax H3 Temporal Window & Spatial Tiles node](node.png)
