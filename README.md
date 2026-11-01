@@ -1,3 +1,5 @@
+![Minimax H3 Temporal Window & Spatial Tiles node](node.png)
+
 # Minimax H3 Temporal Window & Spatial Tiles
 
 by Mohamed ([mo-akkakk](https://registry.comfy.org/publishers/mo-akkakk))
@@ -92,4 +94,3 @@ Run this from the ComfyUI root. The tests run ComfyUI's real H3 conditioning, mo
 
 MIT, © 2026 Mohamed ([mo-akkakk](https://registry.comfy.org/publishers/mo-akkakk)).
 
-![Minimax H3 Temporal Window & Spatial Tiles node](node.png)
