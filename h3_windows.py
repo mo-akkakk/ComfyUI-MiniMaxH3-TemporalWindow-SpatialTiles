@@ -45,17 +45,23 @@ def audio_ticks(frames):
     return round(frames * FRAME_RESCALE)
 
 
-def plan_windows(latent_t, window_frames, overlap_frames):
-    """[(start, length)] in latent tokens. Clip-aligned; the last window is pulled back to end on the last frame."""
+def plan_windows(latent_t, window_frames, overlap_frames, min_final_frames=0):
+    """[(start, length)] in latent tokens, clip-aligned.
+
+    The last window ends on the last frame. By default it is pulled back to the full window
+    length. With min_final_frames > 0 it keeps its natural (shorter) length when that is at
+    least min_final_frames, and is otherwise pulled back only far enough to reach that minimum.
+    """
     win = tokens_for_frames(window_frames)
     if window_frames <= 0 or win >= latent_t:
         return [(0, latent_t)]
     ov = min(tokens_for_frames(overlap_frames), win - CLIP_TOKENS)
+    min_tok = min(win, tokens_for_frames(min_final_frames)) if min_final_frames > 0 else win
     windows = [(0, win)]
     while windows[-1][0] + win < latent_t:
         start = windows[-1][0] + win - ov
-        if start + win > latent_t:
-            start = (latent_t - win) // CLIP_TOKENS * CLIP_TOKENS
+        if start + win > latent_t and latent_t - start < min_tok:
+            start = (latent_t - min_tok) // CLIP_TOKENS * CLIP_TOKENS
         windows.append((start, min(win, latent_t - start)))
     return windows
 
@@ -247,9 +253,11 @@ def piece_conds(conds, k0, k1, ys, xs, lat_h, lat_w, crop_images, carry, warned,
 
 
 class WindowsWrapper:
-    def __init__(self, window_frames, overlap_frames, carry_overlap, tile_h, tile_w, tile_overlap, crop_images):
+    def __init__(self, window_frames, overlap_frames, carry_overlap, tile_h, tile_w, tile_overlap, crop_images,
+                 min_final_frames=0):
         self.window_frames = window_frames
         self.overlap_frames = overlap_frames
+        self.min_final_frames = min_final_frames
         self.carry_overlap = carry_overlap
         self.tile_h, self.tile_w, self.tile_overlap = tile_h, tile_w, tile_overlap
         self.crop_images = crop_images
@@ -261,7 +269,7 @@ class WindowsWrapper:
             return executor(noise, latent_image, sampler, sigmas, denoise_mask, callback, disable_pbar, seed, latent_shapes=latent_shapes)
         vshape, ashape = latent_shapes[0], latent_shapes[1]
         latent_t, lat_h, lat_w, audio_t = vshape[2], vshape[3], vshape[4], ashape[-1]
-        windows = plan_windows(latent_t, self.window_frames, self.overlap_frames)
+        windows = plan_windows(latent_t, self.window_frames, self.overlap_frames, self.min_final_frames)
         ys = plan_tiles(lat_h, self.tile_h, self.tile_overlap)
         xs = plan_tiles(lat_w, self.tile_w, self.tile_overlap)
         if len(windows) == 1 and len(ys) == 1 and len(xs) == 1:

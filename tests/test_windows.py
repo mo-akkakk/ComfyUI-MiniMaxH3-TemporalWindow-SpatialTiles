@@ -103,8 +103,8 @@ def run(model, pos, lat, sigmas, seed=3):
     return SamplerCustomAdvanced.execute(Noise_RandomNoise(seed), g, comfy.samplers.sampler_object("euler"), sigmas, lat).result
 
 
-def patch(model, clip, frames=124, overlap=22, tiles=False, tw=960, th=544, tov=256):
-    return pack.MiniMaxH3TemporalWindow.execute(model, frames > 0, max(frames, 22), overlap, True, tiles, tw, th, tov, True, clip=clip).result
+def patch(model, clip, frames=124, overlap=22, tiles=False, tw=960, th=544, tov=256, short_final=False, min_final=22):
+    return pack.MiniMaxH3TemporalWindow.execute(model, frames > 0, max(frames, 22), overlap, short_final, min_final, True, tiles, tw, th, tov, True, clip=clip).result
 
 
 def test_plans():
@@ -127,6 +127,53 @@ def test_switch_off_is_native(model):
     pos2, lat2 = conditioning(c, plate, ref, W, H, N)
     mine = run(m, pos2, lat2, sigmas)[0]["samples"].unbind()
     check("temporal_windows off: whole length in one native pass", torch.equal(native[0], mine[0]) and torch.equal(native[1], mine[1]))
+
+
+def test_short_final_window_plan():
+    T = h3.temporal_shape(362)[1]
+    F = hw.frames_for_tokens
+    full = hw.plan_windows(T, 243, 22)
+    short = hw.plan_windows(T, 243, 22, 22)
+    check("default: final window pulled back to full length {}".format([(F(s), F(n)) for s, n in full]), F(full[-1][1]) == 243)
+    check("short final window keeps its natural length {}".format([(F(s), F(n)) for s, n in short]),
+          F(short[-1][1]) == 141 and short[-1][0] + short[-1][1] == T)
+    T2 = h3.temporal_shape(719)[1]
+    w = hw.plan_windows(T2, 192, 22, 124)
+    check("short tail below the minimum is pulled back only to the minimum {}".format([(F(s), F(n)) for s, n in w]),
+          F(w[-1][1]) == 124 and w[-1][0] + w[-1][1] == T2)
+    ok = True
+    for frames in (124, 209, 362, 400, 719):
+        Tn = h3.temporal_shape(frames)[1]
+        for mn in (5, 22, 39, 56):
+            ws = hw.plan_windows(Tn, 124, 22, mn)
+            ok &= ws[0][0] == 0 and ws[-1][0] + ws[-1][1] == Tn and all(s % 5 == 0 and (n - 2) % 5 == 0 for s, n in ws)
+            ok &= all(ws[i][0] + ws[i][1] > ws[i + 1][0] for i in range(len(ws) - 1))
+            ok &= F(ws[-1][1]) >= min(mn, 124)
+    check("every plan with a short final window is valid, overlapping and covers the shot", bool(ok))
+
+
+def test_short_final_window_sampling(model):
+    W, H, N = 384, 256, 260
+    plate, ref = torch.rand(N, H, W, 3), torch.rand(1, H, W, 3)
+    m, c = patch(model, FakeClip(), frames=124, overlap=22, short_final=True, min_final=5)
+    pos, lat = conditioning(c, plate, ref, W, H, N)
+    T = lat["samples"].unbind()[0].shape[2]
+    wins = hw.plan_windows(T, 124, 22, 5)
+    lengths = []
+    orig = comfy.samplers.CFGGuider.inner_sample
+
+    def rec(self, *a, **k):
+        lengths.append(k["latent_shapes"][0][2])
+        return orig(self, *a, **k)
+    comfy.samplers.CFGGuider.inner_sample = rec
+    try:
+        sigmas = comfy.samplers.calculate_sigmas(model.get_model_object("model_sampling"), "simple", 1)
+        out = run(m, pos, lat, sigmas)[0]["samples"].unbind()
+    finally:
+        comfy.samplers.CFGGuider.inner_sample = orig
+    check("sampling with a short final window ({} frames) covers the shot".format(hw.frames_for_tokens(wins[-1][1])),
+          lengths == [n for _, n in wins] and wins[-1][1] < hw.tokens_for_frames(124)
+          and out[0].shape == lat["samples"].unbind()[0].shape and bool(torch.isfinite(out[0]).all()))
 
 
 def test_one_window_is_native(model):
@@ -237,10 +284,12 @@ def test_stage2_tiles(model):
 
 if __name__ == "__main__":
     test_plans()
+    test_short_final_window_plan()
     with tempfile.TemporaryDirectory() as d:
         model = tiny_model(os.path.join(d, "tiny_h3.safetensors"))
         test_one_window_is_native(model)
         test_switch_off_is_native(model)
+        test_short_final_window_sampling(model)
         test_windows(model)
         test_ksampler(model)
         test_stage2_tiles(model)

@@ -41,6 +41,8 @@ Everything else is the stock H3 workflow: Reference to Video, Add Guide, Sampler
 | `temporal_windows` | Split the shot into overlapping windows. Off = the whole length runs as one pass. |
 | `window_frames` | Frames per window, on H3's 17k+5 grid (124 = 5.2 s, 175 = 7.3 s). Keep it within what H3 handles accurately on your setup. |
 | `overlap_frames` | Frames shared by neighbouring windows (5, 22, 39…). They are carried into the next window as its frame-0 guide, then crossfaded. The last window is pulled back to end on the last frame, so its overlap can be larger. |
+| `short_final_window` | Off (default): the last window is pulled back so it is a full `window_frames` long, which re-generates some frames at the end. On: the last window keeps its natural, shorter length, which saves those frames — most useful with large windows. |
+| `min_final_window_frames` | With `short_final_window` on: the shortest the last window may be (17k+5: 5, 22, 39, 56…). A shorter tail is pulled back only far enough to reach it. |
 | `carry_overlap` | Carry the finished overlap (video and audio) into the next window. |
 | `spatial_tiles` | Split each window into overlapping tiles (stage 1 or stage 2). Needs a plate: without a reference video, a full-denoise pass in tiles repeats the subject in every tile. |
 | `tile_width` / `tile_height` / `tile_overlap` | Tile size in pixels. Use a size H3 handles well on your setup, with ≥ 192 px overlap. |
