@@ -413,9 +413,10 @@ class WindowsWrapper:
                     p_lat = comfy.utils.pack_latents([canvas[:, :, :, y0:y1, x0:x1].to(device=lat_v.device, dtype=lat_v.dtype), a_src])[0]
                     p_mask = None
                     if masks is not None or v_mask is not None or hold_audio:
-                        dev = masks[0].device if masks is not None else noise_v.device
+                        # the guider moves noise and latent to the GPU itself, but not the mask: build it on the model's device
+                        dev = guider.model_patcher.load_device
                         if masks is not None:
-                            mv = masks[0].expand(vshape)[vs].float()
+                            mv = masks[0].expand(vshape)[vs].float().to(dev)
                             ma = masks[1].expand(ashape)[..., a0:a1].float().to(dev)
                         else:
                             mv = torch.ones(shapes[0], device=dev)
