@@ -6,6 +6,9 @@ by Mohamed ([mo-akkakk](https://registry.comfy.org/publishers/mo-akkakk))
 
 ## What's new
 
+**1.0.5**
+- Fix: with spatial tiles on, 1.0.4 could stop with "Expected all tensors to be on the same device (cuda:0 and cpu)". The tile mask is now built on the GPU.
+
 **1.0.4**
 - Tiles now run one after another. Each tile is prefilled with its finished neighbours over the overlap: the outer half of that band is frozen and the inner half is blended in, so seams continue the neighbour instead of being averaged.
 - New `tile_audio` setting. `generate_once` (default): the first tile makes the soundtrack and the other tiles keep it, instead of averaging one soundtrack per tile. `keep_input`: the incoming audio is kept untouched (stage 2).
@@ -116,7 +119,6 @@ Run this from the ComfyUI root. The tests run ComfyUI's real H3 conditioning, mo
 ## Limits
 
 - Tiles still each see only their own crop, so very large flat areas (sky, walls) can drift slightly in tone across a big frame. `color_match` and a wider `tile_overlap` help.
-- Batch size 1, the same as native H3.
 
 ## Credits
 
