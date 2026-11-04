@@ -103,8 +103,10 @@ def run(model, pos, lat, sigmas, seed=3):
     return SamplerCustomAdvanced.execute(Noise_RandomNoise(seed), g, comfy.samplers.sampler_object("euler"), sigmas, lat).result
 
 
-def patch(model, clip, frames=124, overlap=22, tiles=False, tw=960, th=544, tov=256, short_final=False, min_final=22):
-    return pack.MiniMaxH3TemporalWindow.execute(model, frames > 0, max(frames, 22), overlap, short_final, min_final, True, tiles, tw, th, tov, True, clip=clip).result
+def patch(model, clip, frames=124, overlap=22, tiles=False, tw=960, th=544, tov=256, short_final=False, min_final=22,
+          tile_audio="generate_once", color_match=False):
+    return pack.MiniMaxH3TemporalWindow.execute(model, frames > 0, max(frames, 22), overlap, short_final, min_final, True, tiles, tw, th, tov, True,
+                                                tile_audio=tile_audio, color_match=color_match, clip=clip).result
 
 
 def test_plans():
@@ -282,9 +284,103 @@ def test_stage2_tiles(model):
     check("per-tile prompt sees the tile's crop of <Video 1>", len(crops) == n_pieces and all(h < H and w < W for h, w in crops), str(sorted(set(crops))))
 
 
+def test_guide_helpers():
+    F = hw.frames_for_tokens
+    # a 22-frame guide clip (7 latents) at frame 39 crosses the end of a 56-frame window
+    clip = torch.randn(1, 24, 7, 4, 6)
+    audio = torch.randn(1, 32, 2, hw.audio_ticks(22))
+    kfs = [{"resolved_frame_index": 39, "latent": clip, "audio_latent": audio, "strength": 1.0}]
+    out = hw.window_keyframes(kfs, 0, hw.tokens_for_frames(56), set())
+    vid = [k for k in out if k.get("latent") is not None]
+    aud = [k for k in out if k.get("latent") is None]
+    ok = len(vid) == 1 and vid[0]["resolved_frame_index"] == 39 and torch.equal(vid[0]["latent"], clip[:, :, :5]) and vid[0].get("strength") == 1.0
+    ok &= len(aud) == 1 and aud[0]["audio_latent"].shape[-1] >= 1
+    ok &= aud[0]["resolved_frame_index"] * hw.FRAME_RESCALE + aud[0]["audio_latent"].shape[-1] <= hw.audio_ticks(56) + 1
+    check("a guide clip crossing the window edge keeps its 17-frame chunk inside (video) and its audio inside", bool(ok))
+    # next window starts at frame 51 (latent 15): only the clip's second chunk (frames 56-60) is inside
+    out = hw.window_keyframes(kfs, 15, 15 + hw.tokens_for_frames(56), set())
+    vid = [k for k in out if k.get("latent") is not None]
+    ok = len(vid) == 1 and vid[0]["resolved_frame_index"] == 56 - F(15) and torch.equal(vid[0]["latent"], clip[:, :, 5:])
+    check("the next window keeps the clip's later chunk, re-timed", bool(ok))
+    r = hw.resize_keyframes([{"resolved_frame_index": 0, "latent": torch.randn(1, 24, 1, 8, 12)}, {"resolved_frame_index": 0, "audio_latent": audio}], 16, 24, set())
+    check("guide latents at another resolution are resized to the canvas", tuple(r[0]["latent"].shape) == (1, 24, 1, 16, 24) and "latent" not in r[1])
+    p, fz, band = hw.band_profile(20, 8)
+    check("tile band: outer half frozen, inner half ramps, rest free",
+          bool((p[:fz] == 0).all()) and fz == 4 and bool((p[fz:band] > 0).all() and (p[fz:band] < 1).all()) and bool((p[band:] == 1).all()))
+    a, b = torch.randn(1, 24, 2, 8, 8), torch.randn(1, 24, 2, 8, 8)
+    dc = hw.dc_offset([(a + 1.0, a)])
+    check("colour match offset is clamped", dc is not None and bool(torch.allclose(dc, torch.full((24,), hw.COLOR_CLAMP))))
+
+
+def sample_pieces(m, pos, lat, sigmas):
+    pieces = []
+    orig = comfy.samplers.CFGGuider.inner_sample
+
+    def rec(self, noise, latent_image, device, sampler, sigmas, denoise_mask, callback, disable_pbar, seed, latent_shapes=None):
+        piece = {"shapes": latent_shapes, "lat": comfy.utils.unpack_latents(latent_image.cpu(), latent_shapes),
+                 "mask": comfy.utils.unpack_latents(denoise_mask.cpu(), latent_shapes) if denoise_mask is not None else None}
+        out = orig(self, noise, latent_image, device, sampler, sigmas, denoise_mask, callback, disable_pbar, seed, latent_shapes=latent_shapes)
+        piece["out"] = comfy.utils.unpack_latents(out.cpu(), latent_shapes)
+        pieces.append(piece)
+        return out
+    comfy.samplers.CFGGuider.inner_sample = rec
+    try:
+        out = run(m, pos, lat, sigmas)[0]["samples"].unbind()
+    finally:
+        comfy.samplers.CFGGuider.inner_sample = orig
+    return out, pieces
+
+
+def test_sequential_tiles(model):
+    W, H, N = 640, 384, 56
+    plate, ref = torch.rand(N, H, W, 3), torch.rand(1, H, W, 3)
+    tw, th, tov = 384, 224, 96
+    ys, xs = hw.plan_tiles(H // 16, th // 16, tov // 16), hw.plan_tiles(W // 16, tw // 16, tov // 16)
+    tiles = [(yi, xi) for yi in range(len(ys)) for xi in range(len(xs))]
+    for mode in ("generate_once", "keep_input"):
+        m, c = patch(model, FakeClip(), frames=56, overlap=22, tiles=True, tw=tw, th=th, tov=tov, tile_audio=mode, color_match=True)
+        pos, lat = conditioning(c, plate, ref, W, H, N, guide=False)
+        v, a = lat["samples"].unbind()
+        lat = {"samples": comfy.nested_tensor.NestedTensor((torch.randn_like(v), torch.randn_like(a)))}
+        a_in = lat["samples"].unbind()[1]
+        sigmas = comfy.samplers.calculate_sigmas(m.get_model_object("model_sampling"), "simple", 4)[1:]
+        out, pieces = sample_pieces(m, pos, lat, sigmas)
+        ok = len(pieces) == len(tiles) and bool(torch.isfinite(out[0]).all())
+        ok_frozen = ok_audio = True
+        for k, (yi, xi) in enumerate(tiles):
+            p = pieces[k]
+            (y0, y1), (x0, x1) = ys[yi], xs[xi]
+            top, left = hw.tile_bands(ys, xs, yi, xi)
+            if mode == "generate_once" and k == 0:
+                ok_audio &= p["mask"] is None or bool((p["mask"][1] > 0).all())
+            else:
+                ok_audio &= p["mask"] is not None and bool((p["mask"][1] == 0).all())
+            if k == 0:
+                continue
+            _, fy, _ = hw.band_profile(y1 - y0, top)
+            _, fx, _ = hw.band_profile(x1 - x0, left)
+            mv = p["mask"][0]
+            ok_frozen &= bool((mv[..., :fy, :] == 0).all()) and bool((mv[..., :, :fx] == 0).all())
+            # the frozen band comes back exactly as the finished neighbour left it
+            if fy:
+                ok_frozen &= torch.allclose(p["out"][0][..., :fy, :], out[0][..., y0:y0 + fy, x0:x1], atol=1e-5) or yi + 1 < len(ys)
+                ok_frozen &= torch.allclose(p["out"][0][..., :fy, :], p["lat"][0][..., :fy, :], atol=1e-5)
+            if fx:
+                ok_frozen &= torch.allclose(p["out"][0][..., :, :fx], p["lat"][0][..., :, :fx], atol=1e-5)
+        if mode == "generate_once":
+            ok_audio &= torch.allclose(out[1], pieces[0]["out"][1], atol=1e-5)
+        else:
+            ok_audio &= torch.allclose(out[1], a_in, atol=1e-4)
+        check("tiles ({}): {} tiles one after another, finished output".format(mode, len(tiles)), bool(ok))
+        check("tiles ({}): each tile's band with finished neighbours is prefilled and frozen".format(mode), bool(ok_frozen))
+        check("tiles ({}): soundtrack {}".format(mode, "generated by the first tile and held by the rest" if mode == "generate_once" else "kept from the input in every tile"),
+              bool(ok_audio))
+
+
 if __name__ == "__main__":
     test_plans()
     test_short_final_window_plan()
+    test_guide_helpers()
     with tempfile.TemporaryDirectory() as d:
         model = tiny_model(os.path.join(d, "tiny_h3.safetensors"))
         test_one_window_is_native(model)
@@ -293,5 +389,6 @@ if __name__ == "__main__":
         test_windows(model)
         test_ksampler(model)
         test_stage2_tiles(model)
+        test_sequential_tiles(model)
     print("\n{} failure(s)".format(len(FAILS)))
     sys.exit(1 if FAILS else 0)

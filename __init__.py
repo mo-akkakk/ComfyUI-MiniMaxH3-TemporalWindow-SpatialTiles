@@ -35,23 +35,32 @@ class MiniMaxH3TemporalWindow(io.ComfyNode):
                 io.Boolean.Input("carry_overlap", default=True,
                                  tooltip="Give each window the previous window's finished overlap frames (video and audio) as its frame-0 guide."),
                 io.Boolean.Input("spatial_tiles", default=False,
-                                 tooltip="Split each window into overlapping tiles, for stage 1 or stage 2. Each tile follows its crop of the plate. Without a reference video, a full-denoise pass in tiles repeats the subject."),
+                                 tooltip="Split each window into overlapping tiles, for stage 1 or stage 2. Tiles run one after another; each one "
+                                         "continues its finished neighbours over the overlap (outer half frozen, inner half blended in). "
+                                         "Each tile follows its crop of the plate. Without a reference video, a full-denoise pass in tiles repeats the subject."),
                 io.Int.Input("tile_width", default=960, min=256, max=16384, step=32),
                 io.Int.Input("tile_height", default=544, min=256, max=16384, step=32),
                 io.Int.Input("tile_overlap", default=256, min=0, max=8192, step=32),
                 io.Boolean.Input("crop_ref_images_per_tile", default=True,
                                  tooltip="With tiles, crop <Picture N> to each tile too. On when the picture is a frame of this shot; off for character/style references."),
+                io.Combo.Input("tile_audio", options=["generate_once", "keep_input"], default="generate_once",
+                               tooltip="With tiles: generate_once = the first tile generates the soundtrack and the other tiles keep it. "
+                                       "keep_input = keep the incoming audio latent untouched in every tile (stage 2, when stage 1's audio is final)."),
+                io.Boolean.Input("color_match", default=False,
+                                 tooltip="Remove a small colour/brightness offset (per-channel median, clamped) between a tile and its "
+                                         "finished neighbours, and between a window and the previous one over their overlap. Off = no correction."),
             ],
             outputs=[io.Model.Output(), io.Clip.Output()],
         )
 
     @classmethod
     def execute(cls, model, temporal_windows, window_frames, overlap_frames, short_final_window, min_final_window_frames, carry_overlap, spatial_tiles, tile_width, tile_height,
-                tile_overlap, crop_ref_images_per_tile, clip=None) -> io.NodeOutput:
+                tile_overlap, crop_ref_images_per_tile, tile_audio="generate_once", color_match=False, clip=None) -> io.NodeOutput:
         wrapper = WindowsWrapper(window_frames if temporal_windows else 0, overlap_frames, carry_overlap,
                                  tile_height // 16 if spatial_tiles else 0, tile_width // 16 if spatial_tiles else 0,
                                  tile_overlap // 16, crop_ref_images_per_tile,
-                                 min_final_window_frames if short_final_window else 0)
+                                 min_final_window_frames if short_final_window else 0,
+                                 tile_audio, color_match)
         return io.NodeOutput(apply(model, wrapper), recording_clip(clip) if clip is not None else None)
 
 
