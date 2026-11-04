@@ -13,16 +13,12 @@ SamplerCustomAdvanced and any guider, and every piece is an ordinary native H3 r
   * with the CLIP routed through the node, the prompt is re-encoded per window, so Qwen
     sees only that window of <Video N> with timestamps from 0 (like a manual batch),
     and per tile with the matching crop;
-  * optional spatial tiles inside a window, sampled one after another in raster order: each
-    tile is prefilled with its finished neighbours over the shared band, whose outer half is
-    frozen (denoise 0) and inner half ramps up to full denoise, so seams continue the
-    neighbour instead of being averaged; the soundtrack is generated once (first tile) and
-    held for the other tiles;
+  * optional spatial tiles inside a window, each sampled on its own crop and feather-blended;
+    the soundtrack is taken from the first tile (or kept from the input);
   * optional colour match: a small per-channel DC offset (median, clamped) between a tile
     and its neighbours, and between a window and the previous window over their overlap.
 
-Ideas for the 1.0.4 tile seams, held tile audio, guide resize and colour match come from
-LBH-123-AI's MMH3 Split Upscale; cropping guide clips at 5-latent chunks comes from the
+Ideas for the guide resize and colour match come from LBH-123-AI's MMH3 Split Upscale; cropping guide clips at 5-latent chunks comes from the
 native MiniMaxH3ContextWindows support in ComfyUI.
 """
 
@@ -90,37 +86,26 @@ def plan_tiles(total, size, overlap):
     return spans
 
 
+def feather(n, left, right):
+    w = torch.ones(n)
+    i = torch.arange(n, dtype=torch.float32)
+    if left > 0:
+        w = torch.minimum(w, (i + 1.0) / (left + 1.0))
+    if right > 0:
+        w = torch.minimum(w, (n - i) / (right + 1.0))
+    return w
+
+
 def ease_in_out(n):
     t = torch.linspace(0.0, 1.0, n + 2)[1:-1]
     return t * t * (3.0 - 2.0 * t)
 
 
-def band_profile(n, band):
-    """Denoise strength across a tile edge shared with a finished neighbour: outer half frozen (0), inner half ramps to 1."""
-    p = torch.ones(n)
-    band = min(max(band, 0), n)
-    if band <= 0:
-        return p, 0, 0
-    frozen = band // 2 // 2 * 2
-    p[:frozen] = 0.0
-    if band > frozen:
-        p[frozen:band] = torch.linspace(0.0, 1.0, band - frozen + 2)[1:-1]
-    return p, frozen, band
-
-
-def tile_bands(ys, xs, yi, xi):
-    """(top, left) bands shared with tiles already sampled in raster order, in latent units."""
-    top = ys[yi - 1][1] - ys[yi][0] if yi > 0 else 0
-    left = xs[xi - 1][1] - xs[xi][0] if xi > 0 else 0
-    return top, left
-
-
-def tile_mask(ys, xs, yi, xi):
+def tile_weight(ys, xs, yi, xi):
     (y0, y1), (x0, x1) = ys[yi], xs[xi]
-    top, left = tile_bands(ys, xs, yi, xi)
-    py, _, _ = band_profile(y1 - y0, top)
-    px, _, _ = band_profile(x1 - x0, left)
-    return torch.minimum(py.view(-1, 1), px.view(1, -1))
+    wy = feather(y1 - y0, ys[yi - 1][1] - y0 if yi > 0 else 0, y1 - ys[yi + 1][0] if yi + 1 < len(ys) else 0)
+    wx = feather(x1 - x0, xs[xi - 1][1] - x0 if xi > 0 else 0, x1 - xs[xi + 1][0] if xi + 1 < len(xs) else 0)
+    return wy.view(-1, 1) * wx.view(1, -1)
 
 
 def dc_offset(pairs, clamp=COLOR_CLAMP, min_samples=64):
@@ -382,13 +367,12 @@ class WindowsWrapper:
                 carry_t = 0
                 if self.carry_overlap and done_t > t0:
                     carry_t = tokens_for_frames(frames_for_tokens(done_t - t0))
-                # finished tiles are written into the canvas; later tiles read their frozen bands from it
-                canvas = lat_v[:, :, t0:t0 + tn].float().cpu().clone()
+                win_v = torch.zeros(vshape[:2] + (tn,) + tuple(vshape[3:]), dtype=torch.float32)
                 win_a = None
+                weight = torch.zeros((1, 1, 1, lat_h, lat_w))
                 for ti, (yi, xi) in enumerate(tiles):
                     comfy.model_management.throw_exception_if_processing_interrupted()
                     (y0, y1), (x0, x1) = ys[yi], xs[xi]
-                    th, tw = y1 - y0, x1 - x0
                     vs = (slice(None), slice(None), slice(t0, t0 + tn), slice(y0, y1), slice(x0, x1))
                     carry = None
                     if carry_t:
@@ -399,49 +383,33 @@ class WindowsWrapper:
                     guider.conds = piece_conds(base_conds, t0, t0 + tn, ys[yi] if split_space else None,
                                                xs[xi] if split_space else None, lat_h, lat_w, self.crop_images,
                                                carry, self.warned, text_cache)
-                    shapes = [torch.Size(vshape[:2] + (tn, th, tw)), torch.Size(tuple(ashape[:-1]) + (a1 - a0,))]
-
-                    v_mask = tile_mask(ys, xs, yi, xi) if split_space else None
-                    if v_mask is not None and bool((v_mask >= 1.0).all()):
-                        v_mask = None
-                    hold_audio = split_space and (self.tile_audio == "keep_input" or ti > 0)
-                    a_src = lat_a[..., a0:a1]
-                    if hold_audio and self.tile_audio != "keep_input" and win_a is not None:
-                        a_src = win_a.to(device=lat_a.device, dtype=lat_a.dtype)
-
+                    shapes = [torch.Size(vshape[:2] + (tn, y1 - y0, x1 - x0)), torch.Size(tuple(ashape[:-1]) + (a1 - a0,))]
                     p_noise = comfy.utils.pack_latents([noise_v[vs], noise_a[..., a0:a1]])[0]
-                    p_lat = comfy.utils.pack_latents([canvas[:, :, :, y0:y1, x0:x1].to(device=lat_v.device, dtype=lat_v.dtype), a_src])[0]
+                    p_lat = comfy.utils.pack_latents([lat_v[vs], lat_a[..., a0:a1]])[0]
                     p_mask = None
-                    if masks is not None or v_mask is not None or hold_audio:
-                        # the guider moves noise and latent to the GPU itself, but not the mask: build it on the model's device
-                        dev = guider.model_patcher.load_device
-                        if masks is not None:
-                            mv = masks[0].expand(vshape)[vs].float().to(dev)
-                            ma = masks[1].expand(ashape)[..., a0:a1].float().to(dev)
-                        else:
-                            mv = torch.ones(shapes[0], device=dev)
-                            ma = torch.ones(shapes[1], device=dev)
-                        if v_mask is not None:
-                            mv = mv * v_mask.to(dev).view(1, 1, 1, th, tw)
-                        if hold_audio:
-                            ma = torch.zeros_like(ma)
-                        p_mask = comfy.utils.pack_latents([mv.contiguous(), ma.contiguous()])[0]
+                    if masks is not None:
+                        p_mask = comfy.utils.pack_latents([masks[0].expand(vshape)[vs], masks[1].expand(ashape)[..., a0:a1]])[0]
                     res = executor(p_noise, p_lat, sampler, sigmas, p_mask, None, disable_pbar, seed, latent_shapes=shapes)
                     rv, ra = comfy.utils.unpack_latents(res, shapes)[:2]
                     rv = rv.float().cpu()
-
-                    if self.color_match and v_mask is not None:
-                        old = canvas[:, :, :, y0:y1, x0:x1]
-                        top, left = tile_bands(ys, xs, yi, xi)
-                        _, fy, by = band_profile(th, top)
-                        _, fx, bx = band_profile(tw, left)
-                        dc = dc_offset([(rv[:, :, :, fy:by], old[:, :, :, fy:by]), (rv[..., fx:bx], old[..., fx:bx])])
-                        if dc is not None:
-                            rv = rv - dc.view(1, -1, 1, 1, 1) * v_mask.view(1, 1, 1, th, tw)
-                    canvas[:, :, :, y0:y1, x0:x1] = rv
+                    w = tile_weight(ys, xs, yi, xi).view(1, 1, 1, y1 - y0, x1 - x0)
+                    if self.color_match and ti > 0:
+                        # match the tile to what the finished tiles already put in the shared area
+                        wr = weight[:, :, :, y0:y1, x0:x1]
+                        sel = (wr[0, 0, 0] > 0)
+                        if bool(sel.any()):
+                            acc = (win_v[:, :, :, y0:y1, x0:x1] / wr.clamp(min=1e-6))
+                            dc = dc_offset([(rv[..., sel].unsqueeze(-1), acc[..., sel].unsqueeze(-1))])
+                            if dc is not None:
+                                rv = rv - dc.view(1, -1, 1, 1, 1)
+                    win_v[:, :, :, y0:y1, x0:x1] += rv * w
+                    weight[:, :, :, y0:y1, x0:x1] += w
                     if win_a is None:
+                        # one soundtrack: the first tile's (averaging differently generated soundtracks blurs them)
                         win_a = ra.float().cpu()
-                win_v = canvas
+                win_v /= weight
+                if split_space and self.tile_audio == "keep_input":
+                    win_a = lat_a[..., a0:a1].float().cpu()
 
                 ov_t = max(0, done_t - t0)
                 if ov_t > 0 and self.color_match:
