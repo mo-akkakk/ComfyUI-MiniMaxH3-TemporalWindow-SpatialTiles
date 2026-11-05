@@ -126,6 +126,62 @@ def crop_box(ys, xs, lat_h, lat_w, rh, rw):
     return ry0, ry1, rx0, rx1
 
 
+def exact_crop(lat, ys, xs, lat_h, lat_w):
+    """The tile's exact area of a latent on another grid, resampled to an even size.
+    On the same grid (stage 1, plate == canvas) this is a plain slice, so nothing changes there."""
+    rh, rw = lat.shape[-2], lat.shape[-1]
+    fy0, fy1 = ys[0] * rh / lat_h, ys[1] * rh / lat_h
+    fx0, fx1 = xs[0] * rw / lat_w, xs[1] * rw / lat_w
+    oh = max(2, int(round((fy1 - fy0) / 2)) * 2)
+    ow = max(2, int(round((fx1 - fx0) / 2)) * 2)
+    if all(abs(v - round(v)) < 1e-6 for v in (fy0, fy1, fx0, fx1)) and round(fy1 - fy0) == oh and round(fx1 - fx0) == ow:
+        return lat[..., round(fy0):round(fy1), round(fx0):round(fx1)]
+    lead = lat.shape[:-2]
+    gy = (fy0 + (torch.arange(oh, dtype=torch.float32) + 0.5) * (fy1 - fy0) / oh) / rh * 2 - 1
+    gx = (fx0 + (torch.arange(ow, dtype=torch.float32) + 0.5) * (fx1 - fx0) / ow) / rw * 2 - 1
+    grid = torch.stack(torch.meshgrid(gy, gx, indexing="ij")[::-1], dim=-1).unsqueeze(0).to(lat.device)
+    src = lat.reshape(1, -1, rh, rw).float()
+    out = torch.nn.functional.grid_sample(src, grid, mode="bilinear", padding_mode="border", align_corners=False)
+    return out.reshape(tuple(lead) + (oh, ow)).to(lat.dtype)
+
+
+REF_SHORT_EDGE, REF_MAX_PIXELS = 768, 768 * 1344
+
+
+def ref_size(w, h):
+    """H3's reference-video size for a w x h source (as in MiniMax H3 Reference to Video): 768 short edge,
+    768*1344 area cap, multiples of 32, never upscaled."""
+    ratio = w / h
+    nw, nh = (REF_SHORT_EDGE * ratio, REF_SHORT_EDGE) if ratio >= 1.0 else (REF_SHORT_EDGE, REF_SHORT_EDGE / ratio)
+    if nw * nh > REF_MAX_PIXELS:
+        k = math.sqrt(REF_MAX_PIXELS / (nw * nh))
+        nw, nh = nw * k, nh * k
+    cw, ch = max(32, round(nw / 32) * 32), max(32, round(nh / 32) * 32)
+    if w * h < cw * ch:
+        cw, ch = max(32, round(w / 32) * 32), max(32, round(h / 32) * 32)
+    return cw, ch
+
+
+def plate_latent(plate, vae, f_start, f_count, ys, xs, lat_h, lat_w, n_tokens, scale=1.0):
+    """Encode the tile's exact area of the full-resolution plate for frames [f_start, f_start + f_count)."""
+    frames = plate[f_start:f_start + f_count]
+    if frames.shape[0] < f_count:
+        return None
+    H, W = frames.shape[1], frames.shape[2]
+    y0, y1 = round(ys[0] / lat_h * H), round(ys[1] / lat_h * H)
+    x0, x1 = round(xs[0] / lat_w * W), round(xs[1] / lat_w * W)
+    crop = frames[:, y0:max(y1, y0 + 1), x0:max(x1, x0 + 1), :3]
+    # plate_scale: 1.0 = the tile's own size; smaller = fewer reference tokens (faster), still an exact crop
+    tw_px = max(32, round((xs[1] - xs[0]) * 16 * scale / 32) * 32)
+    th_px = max(32, round((ys[1] - ys[0]) * 16 * scale / 32) * 32)
+    cw, ch = ref_size(tw_px, th_px)
+    pix = comfy.utils.common_upscale(crop.movedim(-1, 1), cw, ch, "lanczos", "disabled").movedim(1, -1)
+    z = vae.encode(pix)
+    if z.shape[2] != n_tokens:
+        return None
+    return z, ch // 16, cw // 16
+
+
 def crop_pixels(images, ys, xs, lat_h, lat_w):
     h, w = images.shape[1], images.shape[2]
     y0, y1 = round(ys[0] / lat_h * h), max(round(ys[0] / lat_h * h) + 1, round(ys[1] / lat_h * h))
@@ -172,10 +228,9 @@ def tile_refs(refs, ys, xs, lat_h, lat_w, crop_images):
         if blk["kind"] not in ("video", "video_audio") and not (crop_images and blk["kind"] == "image"):
             out.append(blk)
             continue
-        ry0, ry1, rx0, rx1 = crop_box(ys, xs, lat_h, lat_w, blk["latent_h"], blk["latent_w"])
         new = dict(blk)
-        new["latent"] = blk["latent"][..., ry0:ry1, rx0:rx1]
-        new["latent_h"], new["latent_w"] = ry1 - ry0, rx1 - rx0
+        new["latent"] = exact_crop(blk["latent"], ys, xs, lat_h, lat_w)
+        new["latent_h"], new["latent_w"] = new["latent"].shape[-2], new["latent"].shape[-1]
         out.append(new)
     return out
 
@@ -277,7 +332,33 @@ def piece_text(source, f0, frames, ys, xs, lat_h, lat_w, crop_images, cache):
     return cond[0][0], cond[0][1].get("minimax_token_tags")
 
 
-def piece_conds(conds, k0, k1, ys, xs, lat_h, lat_w, crop_images, carry, warned, text_cache):
+def plate_refs(orig, refs, k0, k1, ys, xs, lat_h, lat_w, plate, warned, cache):
+    """Swap the first reference video's tile latent for the tile's exact area of the full-resolution plate."""
+    images, vae, scale = plate
+    vi = next((i for i, b in enumerate(orig) if b["kind"] in ("video", "video_audio")), None)
+    if vi is None:
+        return refs
+    s, e = ref_window_span(orig[vi]["latent_t"], k0, k1)
+    key = ("plate", s, e, ys, xs)
+    if key not in cache:
+        f0 = frames_for_tokens(s)
+        cache[key] = plate_latent(images, vae, f0, frames_for_tokens(e) - f0, ys, xs, lat_h, lat_w, e - s, scale)
+        if cache[key] is None and "plate_short" not in warned:
+            warned.add("plate_short")
+            logging.warning("MiniMax H3 windows: the plate input is shorter than the reference video; "
+                            "those tiles use the reference video instead.")
+    hit = cache[key]
+    if hit is None:
+        return refs
+    z, h, w = hit
+    refs = list(refs)
+    new = dict(refs[vi])
+    new["latent"], new["latent_h"], new["latent_w"] = z, h, w
+    refs[vi] = new
+    return refs
+
+
+def piece_conds(conds, k0, k1, ys, xs, lat_h, lat_w, crop_images, carry, warned, text_cache, plate=None):
     out = {}
     split_space = ys is not None
     f0, frames = frames_for_tokens(k0), frames_for_tokens(k1) - frames_for_tokens(k0)
@@ -287,8 +368,12 @@ def piece_conds(conds, k0, k1, ys, xs, lat_h, lat_w, crop_images, carry, warned,
             c = c.copy()
             refs = c.get("minimax_refs")
             if refs:
+                orig = refs
                 refs = window_refs(refs, k0, k1)
-                c["minimax_refs"] = tile_refs(refs, ys, xs, lat_h, lat_w, crop_images) if split_space else refs
+                refs = tile_refs(refs, ys, xs, lat_h, lat_w, crop_images) if split_space else refs
+                if split_space and plate is not None:
+                    refs = plate_refs(orig, refs, k0, k1, ys, xs, lat_h, lat_w, plate, warned, text_cache)
+                c["minimax_refs"] = refs
             kfs = window_keyframes(c.get("minimax_keyframes") or [], k0, k1, warned)
             if split_space:
                 kfs = tile_keyframes(resize_keyframes(kfs, lat_h, lat_w, warned), ys, xs)
@@ -314,8 +399,10 @@ def piece_conds(conds, k0, k1, ys, xs, lat_h, lat_w, crop_images, carry, warned,
 
 class WindowsWrapper:
     def __init__(self, window_frames, overlap_frames, carry_overlap, tile_h, tile_w, tile_overlap, crop_images,
-                 min_final_frames=0, tile_audio="generate_once", color_match=False, tile_carry="own_tile"):
+                 min_final_frames=0, tile_audio="generate_once", color_match=False, tile_carry="own_tile",
+                 plate=None, vae=None, plate_scale=1.0):
         self.window_frames = window_frames
+        self.plate = (plate, vae, plate_scale) if plate is not None and vae is not None else None
         self.tile_carry = tile_carry
         self.tile_audio = tile_audio
         self.color_match = color_match
@@ -354,10 +441,13 @@ class WindowsWrapper:
         for t0, tn in windows:
             for yi, xi in tiles:
                 piece_conds(base_conds, t0, t0 + tn, ys[yi] if split_space else None, xs[xi] if split_space else None,
-                            lat_h, lat_w, self.crop_images, None, self.warned, text_cache)
+                            lat_h, lat_w, self.crop_images, None, self.warned, text_cache, self.plate)
         logging.info("MiniMax H3 windows: {} window(s) x {} tile(s), {} frames{}.".format(
             len(windows), len(tiles), frames_for_tokens(latent_t),
-            ", per-piece prompts" if text_cache else " (CLIP not routed through the node: every window reads the full-shot prompt)"))
+            ", per-piece prompts" if any(k[0] != "plate" for k in text_cache) else " (CLIP not routed through the node: every window reads the full-shot prompt)"))
+        if self.plate is not None and split_space:
+            logging.info("MiniMax H3 windows: {} tile plate crop(s) encoded from the full-resolution plate.".format(
+                sum(1 for k, v in text_cache.items() if k[0] == "plate" and v is not None)))
 
         done_t = done_a = 0
         prev_tiles = {}  # (yi, xi) -> (t0, raw tile output of the previous window), for tile_carry="own_tile"
@@ -392,7 +482,7 @@ class WindowsWrapper:
                             carry["audio_latent"] = out_a[..., a0:a0 + a_n].clone()
                     guider.conds = piece_conds(base_conds, t0, t0 + tn, ys[yi] if split_space else None,
                                                xs[xi] if split_space else None, lat_h, lat_w, self.crop_images,
-                                               carry, self.warned, text_cache)
+                                               carry, self.warned, text_cache, self.plate)
                     shapes = [torch.Size(vshape[:2] + (tn, y1 - y0, x1 - x0)), torch.Size(tuple(ashape[:-1]) + (a1 - a0,))]
                     p_noise = comfy.utils.pack_latents([noise_v[vs], noise_a[..., a0:a1]])[0]
                     p_lat = comfy.utils.pack_latents([lat_v[vs], lat_a[..., a0:a1]])[0]

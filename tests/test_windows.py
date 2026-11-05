@@ -104,10 +104,10 @@ def run(model, pos, lat, sigmas, seed=3):
 
 
 def patch(model, clip, frames=124, overlap=22, tiles=False, tw=960, th=544, tov=256, short_final=False, min_final=22,
-          tile_audio="generate_once", color_match=False, tile_carry="own_tile"):
+          tile_audio="generate_once", color_match=False, tile_carry="own_tile", plate=None, vae=None, plate_scale=1.0):
     return pack.MiniMaxH3TemporalWindow.execute(model, frames > 0, max(frames, 22), overlap, short_final, min_final, True, tiles, tw, th, tov, True,
                                                 tile_audio=tile_audio, color_match=color_match,
-                                                tile_carry=tile_carry, clip=clip).result
+                                                tile_carry=tile_carry, plate_scale=plate_scale, clip=clip, plate=plate, vae=vae).result
 
 
 def test_plans():
@@ -363,10 +363,10 @@ def test_tile_carry(model):
         carries = []
         orig_pc = hw.piece_conds
 
-        def spy(conds, k0, k1, ys_, xs_, *a):
+        def spy(conds, k0, k1, ys_, xs_, *a, **kw):
             if a[3] is not None:
                 carries.append((k0, ys_, xs_, a[3]["latent"].clone()))
-            return orig_pc(conds, k0, k1, ys_, xs_, *a)
+            return orig_pc(conds, k0, k1, ys_, xs_, *a, **kw)
         hw.piece_conds = spy
         try:
             sigmas = comfy.samplers.calculate_sigmas(m.get_model_object("model_sampling"), "simple", 3)
@@ -389,11 +389,89 @@ def test_tile_carry(model):
             check("tile_carry blended: tiles continue from the blended picture (1.0.6 behaviour)", bool(ok and not own_match))
 
 
+def test_exact_crop():
+    lat_h, lat_w = 96, 168           # 2688x1536 canvas
+    rh, rw = 48, 84                  # 1344x768 plate
+    yy = (torch.arange(rh, dtype=torch.float32) + 0.5) / rh
+    xx = (torch.arange(rw, dtype=torch.float32) + 0.5) / rw
+    ramp = (yy.view(-1, 1) * 3 + xx.view(1, -1) * 5).expand(1, 24, 3, rh, rw).contiguous()
+    worst_new = worst_old = 0.0
+    for ys in hw.plan_tiles(lat_h, 34, 16):
+        for xs in hw.plan_tiles(lat_w, 60, 16):
+            out = hw.exact_crop(ramp, ys, xs, lat_h, lat_w)
+            oh, ow = out.shape[-2:]
+            ty = (ys[0] + (torch.arange(oh) + 0.5) * (ys[1] - ys[0]) / oh) / lat_h
+            tx = (xs[0] + (torch.arange(ow) + 0.5) * (xs[1] - xs[0]) / ow) / lat_w
+            want = ty.view(-1, 1) * 3 + tx.view(1, -1) * 5
+            worst_new = max(worst_new, float((out[0, 0, 0] - want).abs()[1:-1, 1:-1].max()))
+            ry0, ry1, rx0, rx1 = hw.crop_box(ys, xs, lat_h, lat_w, rh, rw)
+            old = ramp[0, 0, 0, ry0:ry1, rx0:rx1]
+            ty = (ys[0] + (torch.arange(ry1 - ry0) + 0.5) * (ys[1] - ys[0]) / (ry1 - ry0)) / lat_h
+            tx = (xs[0] + (torch.arange(rx1 - rx0) + 0.5) * (xs[1] - xs[0]) / (rx1 - rx0)) / lat_w
+            worst_old = max(worst_old, float((old - (ty.view(-1, 1) * 3 + tx.view(1, -1) * 5)).abs().max()))
+    check("exact tile crop on a smaller plate grid lands where the tile is (error {:.3f}, old rounded crop {:.3f})".format(worst_new, worst_old),
+          worst_new < 0.02 and worst_old > 10 * worst_new)
+    same = torch.randn(1, 24, 3, 48, 84)
+    check("exact tile crop on the same grid is a plain slice (stage 1 unchanged)",
+          torch.equal(hw.exact_crop(same, (14, 48), (24, 84), 48, 84), same[..., 14:48, 24:84]))
+
+
+def test_full_res_plate(model):
+    W, H, N = 640, 384, 124
+    torch.manual_seed(7)
+    plate = torch.rand(N, H, W, 3)
+    plate2x = torch.nn.functional.interpolate(plate.movedim(-1, 1), scale_factor=2, mode="bilinear").movedim(1, -1)
+    ref = torch.rand(1, H, W, 3)
+    tw, th, tov = 384, 224, 96
+    ys, xs = hw.plan_tiles(H // 16, th // 16, tov // 16), hw.plan_tiles(W // 16, tw // 16, tov // 16)
+    m, c = patch(model, FakeClip(), frames=73, overlap=22, tiles=True, tw=tw, th=th, tov=tov, plate=plate2x, vae=FakeVAE())
+    pos, lat = conditioning(c, plate, ref, W, H, N, guide=False)
+    seen = []
+    orig_pc = hw.piece_conds
+
+    def spy(conds, k0, k1, ys_, xs_, *a, **kw):
+        out = orig_pc(conds, k0, k1, ys_, xs_, *a, **kw)
+        vid = [b for b in out["positive"][0]["minimax_refs"] if b["kind"] in ("video", "video_audio")][0]
+        seen.append((k0, k1, ys_, xs_, vid))
+        return out
+    hw.piece_conds = spy
+    try:
+        sigmas = comfy.samplers.calculate_sigmas(m.get_model_object("model_sampling"), "simple", 3)[1:]
+        out, pieces = sample_pieces(m, pos, lat, sigmas)
+    finally:
+        hw.piece_conds = orig_pc
+    ok = len(pieces) > 0 and bool(torch.isfinite(out[0]).all())
+    ok_shape = all(v["latent"].shape[-2:] == (y[1] - y[0], x[1] - x[0]) and v["latent"].shape[2] == v["latent_t"]
+                   for k0, k1, y, x, v in seen)
+    k0, k1, y, x, v = seen[0]
+    f0 = hw.frames_for_tokens(k0)
+    crop = plate2x[f0:f0 + hw.frames_for_tokens(v["latent_t"]), y[0] * 32:y[1] * 32, x[0] * 32:x[1] * 32]
+    pix = comfy.utils.common_upscale(crop.movedim(-1, 1), (x[1] - x[0]) * 16, (y[1] - y[0]) * 16, "lanczos", "disabled").movedim(1, -1)
+    ok_px = torch.equal(v["latent"], FakeVAE().encode(pix))
+    check("full-res plate: every tile's <Video 1> is encoded from its exact crop of the plate ({} pieces sampled)".format(len(pieces)),
+          bool(ok and ok_shape and ok_px))
+
+    m, c = patch(model, FakeClip(), frames=73, overlap=22, tiles=True, tw=tw, th=th, tov=tov, plate=plate2x, vae=FakeVAE(), plate_scale=0.5)
+    pos, lat = conditioning(c, plate, ref, W, H, N, guide=False)
+    seen.clear()
+    hw.piece_conds = spy
+    try:
+        out, pieces = sample_pieces(m, pos, lat, sigmas)
+    finally:
+        hw.piece_conds = orig_pc
+    ok = bool(torch.isfinite(out[0]).all()) and len(seen) > 0
+    ok &= all(abs(v["latent"].shape[-2] - (y[1] - y[0]) / 2) <= 1 and abs(v["latent"].shape[-1] - (x[1] - x[0]) / 2) <= 1
+              for k0, k1, y, x, v in seen)
+    check("plate_scale 0.5: each tile's plate piece is half the tile size (a quarter of the reference tokens)", ok)
+
+
 if __name__ == "__main__":
+
 
     test_plans()
     test_short_final_window_plan()
     test_guide_helpers()
+    test_exact_crop()
     with tempfile.TemporaryDirectory() as d:
         model = tiny_model(os.path.join(d, "tiny_h3.safetensors"))
         test_one_window_is_native(model)
@@ -404,5 +482,6 @@ if __name__ == "__main__":
         test_stage2_tiles(model)
         test_tile_audio(model)
         test_tile_carry(model)
+        test_full_res_plate(model)
     print("\n{} failure(s)".format(len(FAILS)))
     sys.exit(1 if FAILS else 0)

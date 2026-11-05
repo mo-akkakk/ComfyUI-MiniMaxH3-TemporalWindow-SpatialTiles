@@ -4,7 +4,19 @@
 
 by Mohamed ([mo-akkakk](https://registry.comfy.org/publishers/mo-akkakk))
 
+Long and high-resolution video-to-video for the **open-weights MiniMax H3** in native ComfyUI. It is one node that goes after the model:
+
+- **Temporal windows:** a long shot is generated as overlapping windows, one after another, each one continuing smoothly from the last.
+- **Spatial tiles:** a big frame is generated as overlapping tiles, each following its own part of your plate (the reference video).
+
+Both work in stage 1 (full denoise) and stage 2 (low-denoise refine). Nothing inside the model is patched: every window and tile is an ordinary native H3 run. With one window and no tiles, the output is bit-identical to the plain native workflow.
+
 ## What's new
+
+**1.0.8**
+- **Exact tile crops (automatic).** When the plate is smaller than the output (always in stage 2, and in stage 1 above about 1 MP), each tile now gets exactly its own area of the plate. Before, the crop was rounded out to a coarse grid, so each tile followed a slightly zoomed or shifted plate and neighbouring tiles disagreed (shifting, doubling or changing content at tile overlaps). When plate and output are the same size, nothing changes.
+- **New optional `plate` + `vae` inputs.** Reference to Video always shrinks reference videos to about 768p. Connect your full-resolution video to `plate` and each tile's plate piece is cut from it at full detail instead. See [The plate input](#the-plate-input-optional).
+- **New `plate_scale` setting** to trade the plate's detail for speed.
 
 **1.0.7**
 - New `tile_carry` setting (default `own_tile`): with tiles and `carry_overlap`, each tile now continues from its own unblended frames of the previous window instead of the blended picture. Blending differences are no longer fed forward from window to window, so long tiled shots no longer slowly drift away from the plate. `blended` keeps the 1.0.6 behaviour.
@@ -40,13 +52,6 @@ by Mohamed ([mo-akkakk](https://registry.comfy.org/publishers/mo-akkakk))
 **1.0.0**
 - First release: sequential temporal windows with overlap carry and crossfade, per-window (and per-tile) prompt re-encoding, spatial tiles, works with KSampler and SamplerCustomAdvanced.
 
-Long video-to-video for the **open-weights MiniMax H3** in native ComfyUI. It is one node that goes after the model.
-
-- **Temporal windows (stage 1 and stage 2).** The shot is sampled as overlapping windows, **one after another**. Each window is an ordinary native H3 run on its own slice of the plate. It starts from the previous window's finished overlap frames, video and audio, which are given to it as a frame-0 guide. The overlap is then crossfaded. This keeps every window inside the length where H3 tracks the plate accurately, while the result runs as long as you like.
-- **Spatial tiles (stage 1 and stage 2).** Each window can be split into overlapping tiles. Each tile runs on its own crop of the plate, with the prompt re-encoded for that crop, and the tiles are feather-blended. The soundtrack is taken from the first tile. This works for a full-denoise first pass as well as a stage-2 refine, because every tile is anchored to its region of the plate.
-
-Nothing inside the model is patched, and every window and tile goes through the native H3 conditioning and sampling code. With a single window and no tiles, the output is bit-identical to the plain native workflow.
-
 ## Install
 
 **ComfyUI Manager / Registry:** search for *Minimax H3 Temporal Window & Spatial Tiles*.
@@ -63,49 +68,79 @@ Restart ComfyUI. It needs ComfyUI with native MiniMax H3 support (v0.35.0 or new
 ```
 UNETLoader -> (shift / LoRA / low-VRAM patches) -> Minimax H3 Temporal Window & Spatial Tiles -> BasicGuider or KSampler
 CLIPLoader ------------------------------------> (clip in ... clip out) -> MiniMax H3 Reference to Video
+Your video at output resolution (optional) ----> plate
+VAE (optional, with plate) --------------------> vae
 ```
 
-Everything else is the stock H3 workflow: Reference to Video, Add Guide, SamplerCustomAdvanced or KSampler, and VAE Decode.
+Everything else is the stock H3 workflow: Reference to Video (with your video as `ref_video_0`), Add Guide, SamplerCustomAdvanced or KSampler, and VAE Decode.
 
-- **Stage 1:** full sigmas. Turn `spatial_tiles` on when the frame is bigger than what H3 handles well on your setup.
-- **Stage 2:** decode → upscale → VAE Encode → Concat AV Latent (with the stage-1 audio), or upscale the latent directly with [LBH-123-AI's MiniMax H3 latent upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler), which skips the decode/encode round trip. Then use a second copy of the node, usually with `spatial_tiles` on, and sample with the low part of SplitSigmas.
+**Always route the CLIP through the node.** It records what Reference to Video encodes and re-encodes the prompt for every window and tile. Qwen then sees only that window's frames of `<Video 1>` (with timestamps from 0), cropped to that tile — exactly like a manually cut batch. Without this, every window reads a description of the whole shot and timing drifts.
 
-**Route the CLIP through the node.** It records what Reference to Video encodes and re-encodes the prompt per window, and per tile. Qwen then sees only that window's frames of `<Video N>`, with timestamps from 0, exactly like a manually cut batch. Without this, every window reads a description of the whole shot, and timing drifts.
+- **Stage 1:** full sigmas.
+- **Stage 2:** decode → upscale → VAE Encode → Concat AV Latent (with the stage-1 audio), or upscale the latent directly with [LBH-123-AI's MiniMax H3 latent upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler). Then use a second copy of the node, usually with `spatial_tiles` on, and sample with low sigmas (see Tips).
 
 ## Settings
 
-| Input | Meaning |
-|---|---|
-| `temporal_windows` | Split the shot into overlapping windows. Off = the whole length runs as one pass. |
-| `window_frames` | Frames per window, on H3's 17k+5 grid (124 = 5.2 s, 175 = 7.3 s). Keep it within what H3 handles accurately on your setup. |
-| `overlap_frames` | Frames shared by neighbouring windows (5, 22, 39…). They are carried into the next window as its frame-0 guide, then crossfaded. The last window is pulled back to end on the last frame, so its overlap can be larger. |
-| `short_final_window` | Off (default): the last window is pulled back so it is a full `window_frames` long, which re-generates some frames at the end. On: the last window keeps its natural, shorter length, which saves those frames — most useful with large windows. |
-| `min_final_window_frames` | With `short_final_window` on: the shortest the last window may be (17k+5: 5, 22, 39, 56…). A shorter tail is pulled back only far enough to reach it. |
-| `carry_overlap` | Carry the finished overlap (video and audio) into the next window. |
-| `spatial_tiles` | Split each window into overlapping tiles (stage 1 or stage 2). Needs a plate: without a reference video, a full-denoise pass in tiles repeats the subject in every tile. |
-| `tile_width` / `tile_height` / `tile_overlap` | Tile size in pixels. Use a size H3 handles well on your setup, with ≥ 192 px overlap. |
-| `crop_ref_images_per_tile` | Crop `<Picture N>` to each tile as well. Turn it on when the picture is a frame of the shot (e.g. an edited first frame). Turn it off for character, product or style references. |
-| `tile_audio` | With tiles. `generate_once` (default): the output uses the soundtrack generated by the first tile. `keep_input`: the output keeps the incoming audio latent untouched — use it in stage 2 when the stage-1 audio is final. |
-| `tile_carry` | With tiles and `carry_overlap`. `own_tile` (default): each tile continues from its own frames of the previous window, so long tiled shots don't drift. `blended`: continue from the blended picture (1.0.6 and earlier). |
-| `color_match` | Off by default. Removes a small colour/brightness offset (per-channel median, clamped to ±0.05 in latent space) between a tile and the tiles already blended into its overlap, and between a window and the previous window over their overlap. Try it if you see a slight tone step at seams. |
+### Temporal windows
 
-Reference videos (the plate) are always sliced per window and cropped per tile, because they are frame-aligned with the output. Frame guides from Add Guide go only into the window that contains their frame. A guide clip that crosses a window edge keeps the 17-frame chunks that lie inside the window, and its audio is kept as a separate audio guide. Guide latents encoded at another resolution are resized to the canvas before tiles crop them.
+| Setting | What it does |
+|---|---|
+| `temporal_windows` | On: the shot is split into overlapping windows. Off: the whole length runs as one native pass (tiles still work). |
+| `window_frames` | Frames per window, on H3's 17k+5 grid (124 = 5.2 s, 175 = 7.3 s). Keep it within what H3 handles accurately on your setup. |
+| `overlap_frames` | Frames shared by neighbouring windows (5, 22, 39…). Bigger = smoother joins, a bit slower. 22 is a good default. |
+| `short_final_window` | Off (default): the last window is pulled back to a full `window_frames`, re-generating some frames at the end. On: the last window keeps its natural shorter length, saving time. |
+| `min_final_window_frames` | With `short_final_window` on: the shortest the last window may be (5, 22, 39, 56…). |
+| `carry_overlap` | On (recommended): each window starts from the previous window's finished overlap frames (video and audio), so motion continues without a jump. |
+
+### Spatial tiles
+
+| Setting | What it does |
+|---|---|
+| `spatial_tiles` | On: each window is split into overlapping tiles. Needs a plate (a reference video): without one, a full-denoise pass in tiles repeats the subject in every tile. |
+| `tile_width` / `tile_height` | Tile size in pixels. Use a size H3 handles well on your setup (for example 960 × 544, or about 1 MP). |
+| `tile_overlap` | Pixels shared by neighbouring tiles, which are feather-blended there. Use 192 px or more. |
+| `crop_ref_images_per_tile` | Also crop `<Picture N>` reference images to each tile. On when the picture is a frame of the shot (e.g. an edited first frame); off for character, product or style references. |
+| `tile_audio` | `generate_once` (default): use the soundtrack generated by the first tile. `keep_input`: keep the incoming audio untouched — use it in stage 2 when the stage-1 audio is final. |
+| `tile_carry` | With `carry_overlap`. `own_tile` (default): each tile continues from its own frames of the previous window, so long tiled shots don't slowly drift. `blended`: continue from the blended picture (1.0.6 and earlier). |
+| `color_match` | Off by default. Removes a small colour/brightness step between a tile and its neighbours, and between a window and the previous one. Try it only if you see a tone step at seams. |
+
+### The plate input (optional)
+
+| Input / setting | What it does |
+|---|---|
+| `plate` | Your video at full resolution. Only used with `spatial_tiles` on. |
+| `vae` | The video VAE, needed with `plate`. |
+| `plate_scale` | Size of each tile's plate piece, relative to the tile. `1.0` = full detail (slowest). `0.5` = a quarter of the reference tokens: much faster, still exactly aligned and sharper than no plate. |
+
+**Why use it.** Reference to Video always shrinks a reference video to about 768p, whatever size you generate. When you generate above about 1 MP, or refine in stage 2, every tile then follows a small, soft piece of that copy. With `plate` connected, each tile's piece is cut from your full-resolution video instead, so tiles follow real detail and stay locked to the original.
+
+**How to feed it:**
+- Keep your video connected to Reference to Video as `ref_video_0` as well — the node needs it for the prompt and timing, and only swaps in the sharper pieces. That copy can be small (e.g. 1 MP), since it is shrunk to 768p anyway.
+- `plate` must be **the same clip**: same first frame, same frames, at least as long — just at higher resolution.
+- Feed it at about **your output resolution**. A 4K plate works but takes a lot of RAM (about 100 MB per frame).
+
+**Cost.** Each tile's plate piece is encoded once with the VAE before sampling, and bigger plate pieces mean more reference tokens at every sampling step. At `plate_scale` 1.0, expect a run to take about 1.6× as long as without the plate (in testing: 1330 s vs 812 s); lower `plate_scale` to get most of that time back.
 
 ## Tips
 
-- Write the prompt as true for **every** frame, because each window reads it on its own.
-- If you see a seam where windows join, increase `overlap_frames` (22 → 39).
-- If you see a seam between tiles, increase `tile_overlap`, then try `color_match`.
+- **Write the prompt so it is true for every frame**, because each window reads it on its own.
+- **Use H3's reference tags in the prompt:** `<Video 1>`, `<Picture 1>`, `<Audio 1>` (counting from 1 for each kind). These are the labels Qwen actually sees; input names like `ref_video_0` are not.
+- **Avoid thin padding bars.** H3 works on 16 × 16-pixel blocks. If you pad a plate to round its size and the bars are thinner than about 16 px, H3 partly paints over them and the picture comes out slightly squashed and shifted. Use edge padding (repeat the last pixel), bars of 32 px or more, or crop instead of padding.
+- **Stage 2: check your real sigmas.** `BasicScheduler` with `denoise` does not start at that amount of noise: with `linear_quadratic`, denoise 0.4 actually starts at sigma 0.93, almost a full re-generation, and windows and tiles will then disagree. For a refine, start around 0.2–0.45 (e.g. with ManualSigmas).
+- **Seam where windows join:** increase `overlap_frames` (22 → 39).
+- **Seam between tiles:** increase `tile_overlap`, then try `color_match`.
+- **Fine texture flickering ("micro-boiling") at high resolution** comes mostly from the model and sampler (few-step LoRAs especially), not from tiling. Generating at about 1 MP and refining in stage 2 at low denoise is the most stable route to high resolution.
 
 ## How it works
 
-The node registers an `OUTER_SAMPLE` wrapper on the model, so it works with any guider and sampler. For each window it does the following:
+The node registers an `OUTER_SAMPLE` wrapper on the model, so it works with any guider and sampler. For each window:
 
 1. It slices the noise and latent to the window, and the audio to the matching span on H3's 40 Hz audio grid.
-2. It re-times the native conditioning to the window. Reference-video latents are sliced, and keyframes are moved to window time.
-3. It appends the previous window's finished overlap as a keyframe clip at frame 0.
+2. It re-times the native conditioning to the window: reference-video latents are sliced, guide frames are moved to window time (a guide clip crossing the window edge keeps its 17-frame chunks inside the window).
+3. It appends the previous window's finished overlap as a guide clip at frame 0.
 4. It swaps in the per-window prompt encoding.
-5. It runs the normal sampling call.
+5. With tiles, it runs each tile on its own crop of everything above — noise, latent, plate, guides and prompt — and feather-blends the tiles.
+6. It crossfades the window into the output.
 
 Windows start on H3's 17-frame VAE-clip boundaries, so every window and every carried overlap is a valid H3 length.
 
@@ -115,20 +150,20 @@ Windows start on H3's 17-frame VAE-clip boundaries, so every window and every ca
 python custom_nodes/ComfyUI-MiniMaxH3-TemporalWindow-SpatialTiles/tests/test_windows.py
 ```
 
-Run this from the ComfyUI root. The tests run ComfyUI's real H3 conditioning, model and sampler code on CPU, with a tiny random-weight DiT and recording stand-ins for Qwen and the VAE. They check that:
+Run this from the ComfyUI root. The tests run ComfyUI's real H3 conditioning, model and sampler code on CPU, with a tiny random-weight DiT and recording stand-ins for Qwen and the VAE. They check, among other things, that:
 
 - a single window is bit-identical to native sampling;
-- each window gets its own slice of the plate;
-- the overlap carry is correct;
+- each window gets its own slice of the plate, and the overlap carry is correct;
 - the per-window prompt shows only that window's frames, with timestamps from 0;
-- it works through KSampler;
-- tiles work with full and partial sigmas;
-- the soundtrack comes from the first tile (or is kept from the input);
-- guide clips crossing a window edge are cropped at 17-frame chunks, and guides at another resolution are resized.
+- it works through KSampler, and tiles work with full and partial sigmas;
+- each tile's plate crop lands exactly on the tile, and is a plain slice when plate and output are the same size;
+- with `plate`, every tile's reference is encoded from its exact crop of the plate, and `plate_scale` sizes it;
+- each tile continues from its own frames (`tile_carry`), and the soundtrack comes from the first tile (or the input).
 
 ## Limits
 
-- Tiles are sampled independently and blended afterwards, so flat areas (sky, walls) can show slight differences between tiles. A wider `tile_overlap` helps, and `color_match` can help with tone steps.
+- Tiles are sampled independently and blended afterwards, so very flat areas (sky, walls) can show slight differences between tiles. A wider `tile_overlap` helps, and `color_match` can help with tone steps.
+- Everything outside the plate (new content your prompt adds) is invented separately per tile and window, so keep the prompt consistent and the overlaps generous.
 
 ## Credits
 
@@ -137,4 +172,3 @@ The guide resize and the colour match are adapted from ideas in [LBH-123-AI's MM
 ## License
 
 MIT, © 2026 Mohamed ([mo-akkakk](https://registry.comfy.org/publishers/mo-akkakk)).
-

@@ -20,6 +20,12 @@ class MiniMaxH3TemporalWindow(io.ComfyNode):
                 io.Clip.Input("clip", optional=True,
                               tooltip="Route the CLIP through here into Reference to Video so each window re-encodes the prompt with only "
                                       "its own slice of <Video N> (timestamps from 0), like a manual batch. Strongly recommended."),
+                io.Image.Input("plate", optional=True,
+                               tooltip="Optional, for tiles: the full-resolution version of the video you feed as ref_video_0 "
+                                       "(same frames, same order, at least as long). Each tile's plate piece is then cut from it "
+                                       "exactly and at full detail, instead of from Reference to Video's 768p copy. Needs vae. "
+                                       "Feed it at about your output resolution (a 4K plate works but uses a lot of RAM). See plate_scale."),
+                io.Vae.Input("vae", optional=True, tooltip="Video VAE, used with plate to encode each tile's plate piece."),
                 io.Boolean.Input("temporal_windows", default=True,
                                  tooltip="Split the shot into overlapping temporal windows. Off = the whole length runs as one native H3 pass."),
                 io.Int.Input("window_frames", default=124, min=22, max=3600, step=17,
@@ -51,18 +57,22 @@ class MiniMaxH3TemporalWindow(io.ComfyNode):
                                tooltip="With tiles and carry_overlap: own_tile = each tile continues from its own unblended frames of the "
                                        "previous window, so blending errors are not fed forward (less drift over long shots). "
                                        "blended = continue from the blended picture (1.0.6 and earlier)."),
+                io.Float.Input("plate_scale", default=1.0, min=0.25, max=1.0, step=0.05,
+                               tooltip="Only with the plate input connected. Size of each tile's plate piece relative to the tile. "
+                                       "1.0 = full detail (slowest: about 4x the reference tokens of no plate). 0.5 = a quarter of the "
+                                       "reference tokens, much faster, still exactly aligned and sharper than without a plate."),
             ],
             outputs=[io.Model.Output(), io.Clip.Output()],
         )
 
     @classmethod
     def execute(cls, model, temporal_windows, window_frames, overlap_frames, short_final_window, min_final_window_frames, carry_overlap, spatial_tiles, tile_width, tile_height,
-                tile_overlap, crop_ref_images_per_tile, tile_audio="generate_once", color_match=False, tile_carry="own_tile", clip=None) -> io.NodeOutput:
+                tile_overlap, crop_ref_images_per_tile, tile_audio="generate_once", color_match=False, tile_carry="own_tile", plate_scale=1.0, clip=None, plate=None, vae=None) -> io.NodeOutput:
         wrapper = WindowsWrapper(window_frames if temporal_windows else 0, overlap_frames, carry_overlap,
                                  tile_height // 16 if spatial_tiles else 0, tile_width // 16 if spatial_tiles else 0,
                                  tile_overlap // 16, crop_ref_images_per_tile,
                                  min_final_window_frames if short_final_window else 0,
-                                 tile_audio, color_match, tile_carry)
+                                 tile_audio, color_match, tile_carry, plate if spatial_tiles else None, vae, plate_scale)
         return io.NodeOutput(apply(model, wrapper), recording_clip(clip) if clip is not None else None)
 
 
