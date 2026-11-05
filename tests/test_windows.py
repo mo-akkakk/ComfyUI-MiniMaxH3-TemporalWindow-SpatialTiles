@@ -104,9 +104,10 @@ def run(model, pos, lat, sigmas, seed=3):
 
 
 def patch(model, clip, frames=124, overlap=22, tiles=False, tw=960, th=544, tov=256, short_final=False, min_final=22,
-          tile_audio="generate_once", color_match=False):
+          tile_audio="generate_once", color_match=False, tile_carry="own_tile"):
     return pack.MiniMaxH3TemporalWindow.execute(model, frames > 0, max(frames, 22), overlap, short_final, min_final, True, tiles, tw, th, tov, True,
-                                                tile_audio=tile_audio, color_match=color_match, clip=clip).result
+                                                tile_audio=tile_audio, color_match=color_match,
+                                                tile_carry=tile_carry, clip=clip).result
 
 
 def test_plans():
@@ -350,7 +351,46 @@ def test_tile_audio(model):
             check("tiles: keep_input outputs the incoming audio", torch.allclose(out[1], a_in, atol=1e-4))
 
 
+def test_tile_carry(model):
+    W, H, N = 640, 384, 124
+    plate, ref = torch.rand(N, H, W, 3), torch.rand(1, H, W, 3)
+    tw, th, tov = 384, 224, 96
+    ys, xs = hw.plan_tiles(H // 16, th // 16, tov // 16), hw.plan_tiles(W // 16, tw // 16, tov // 16)
+    tiles = [(yi, xi) for yi in range(len(ys)) for xi in range(len(xs))]
+    for mode in ("own_tile", "blended"):
+        m, c = patch(model, FakeClip(), frames=73, overlap=22, tiles=True, tw=tw, th=th, tov=tov, tile_carry=mode)
+        pos, lat = conditioning(c, plate, ref, W, H, N, guide=False)
+        carries = []
+        orig_pc = hw.piece_conds
+
+        def spy(conds, k0, k1, ys_, xs_, *a):
+            if a[3] is not None:
+                carries.append((k0, ys_, xs_, a[3]["latent"].clone()))
+            return orig_pc(conds, k0, k1, ys_, xs_, *a)
+        hw.piece_conds = spy
+        try:
+            sigmas = comfy.samplers.calculate_sigmas(m.get_model_object("model_sampling"), "simple", 3)
+            out, pieces = sample_pieces(m, pos, lat, sigmas)
+        finally:
+            hw.piece_conds = orig_pc
+        windows = hw.plan_windows(lat["samples"].unbind()[0].shape[2], 73, 22)
+        n = len(tiles)
+        ok = len(windows) >= 2 and len(carries) == n * (len(windows) - 1) and len(pieces) == n * len(windows)
+        own_match = blended_diff = True
+        for j, (k0, ys_, xs_, c_lat) in enumerate(carries):
+            ti = j % n
+            w_prev = j // n
+            p0 = windows[w_prev][0]
+            raw = pieces[w_prev * n + ti]["out"][0][:, :, k0 - p0:k0 - p0 + c_lat.shape[2]].float()
+            own_match &= torch.allclose(c_lat, raw, atol=1e-5)
+        if mode == "own_tile":
+            check("tile_carry own_tile: each tile continues from its own unblended frames ({} windows x {} tiles)".format(len(windows), n), bool(ok and own_match))
+        else:
+            check("tile_carry blended: tiles continue from the blended picture (1.0.6 behaviour)", bool(ok and not own_match))
+
+
 if __name__ == "__main__":
+
     test_plans()
     test_short_final_window_plan()
     test_guide_helpers()
@@ -363,5 +403,6 @@ if __name__ == "__main__":
         test_ksampler(model)
         test_stage2_tiles(model)
         test_tile_audio(model)
+        test_tile_carry(model)
     print("\n{} failure(s)".format(len(FAILS)))
     sys.exit(1 if FAILS else 0)

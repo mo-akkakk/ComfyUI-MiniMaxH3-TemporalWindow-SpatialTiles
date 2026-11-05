@@ -47,18 +47,22 @@ class MiniMaxH3TemporalWindow(io.ComfyNode):
                 io.Boolean.Input("color_match", default=False,
                                  tooltip="Remove a small colour/brightness offset (per-channel median, clamped) between a tile and the "
                                          "tiles already blended into its overlap, and between a window and the previous one over their overlap. Off = no correction."),
+                io.Combo.Input("tile_carry", options=["own_tile", "blended"], default="own_tile",
+                               tooltip="With tiles and carry_overlap: own_tile = each tile continues from its own unblended frames of the "
+                                       "previous window, so blending errors are not fed forward (less drift over long shots). "
+                                       "blended = continue from the blended picture (1.0.6 and earlier)."),
             ],
             outputs=[io.Model.Output(), io.Clip.Output()],
         )
 
     @classmethod
     def execute(cls, model, temporal_windows, window_frames, overlap_frames, short_final_window, min_final_window_frames, carry_overlap, spatial_tiles, tile_width, tile_height,
-                tile_overlap, crop_ref_images_per_tile, tile_audio="generate_once", color_match=False, clip=None) -> io.NodeOutput:
+                tile_overlap, crop_ref_images_per_tile, tile_audio="generate_once", color_match=False, tile_carry="own_tile", clip=None) -> io.NodeOutput:
         wrapper = WindowsWrapper(window_frames if temporal_windows else 0, overlap_frames, carry_overlap,
                                  tile_height // 16 if spatial_tiles else 0, tile_width // 16 if spatial_tiles else 0,
                                  tile_overlap // 16, crop_ref_images_per_tile,
                                  min_final_window_frames if short_final_window else 0,
-                                 tile_audio, color_match)
+                                 tile_audio, color_match, tile_carry)
         return io.NodeOutput(apply(model, wrapper), recording_clip(clip) if clip is not None else None)
 
 

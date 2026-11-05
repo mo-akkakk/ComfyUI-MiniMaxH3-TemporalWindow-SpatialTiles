@@ -314,8 +314,9 @@ def piece_conds(conds, k0, k1, ys, xs, lat_h, lat_w, crop_images, carry, warned,
 
 class WindowsWrapper:
     def __init__(self, window_frames, overlap_frames, carry_overlap, tile_h, tile_w, tile_overlap, crop_images,
-                 min_final_frames=0, tile_audio="generate_once", color_match=False):
+                 min_final_frames=0, tile_audio="generate_once", color_match=False, tile_carry="own_tile"):
         self.window_frames = window_frames
+        self.tile_carry = tile_carry
         self.tile_audio = tile_audio
         self.color_match = color_match
         self.overlap_frames = overlap_frames
@@ -359,6 +360,7 @@ class WindowsWrapper:
             ", per-piece prompts" if text_cache else " (CLIP not routed through the node: every window reads the full-shot prompt)"))
 
         done_t = done_a = 0
+        prev_tiles = {}  # (yi, xi) -> (t0, raw tile output of the previous window), for tile_carry="own_tile"
         steps = sigmas.shape[-1] - 1
         try:
             for wi, (t0, tn) in enumerate(windows):
@@ -370,13 +372,21 @@ class WindowsWrapper:
                 win_v = torch.zeros(vshape[:2] + (tn,) + tuple(vshape[3:]), dtype=torch.float32)
                 win_a = None
                 weight = torch.zeros((1, 1, 1, lat_h, lat_w))
+                own_carry = split_space and self.tile_carry == "own_tile"
+                cur_tiles = {}
                 for ti, (yi, xi) in enumerate(tiles):
                     comfy.model_management.throw_exception_if_processing_interrupted()
                     (y0, y1), (x0, x1) = ys[yi], xs[xi]
                     vs = (slice(None), slice(None), slice(t0, t0 + tn), slice(y0, y1), slice(x0, x1))
                     carry = None
                     if carry_t:
-                        carry = {"resolved_frame_index": 0, "latent": out_v[:, :, t0:t0 + carry_t, y0:y1, x0:x1].clone()}
+                        if own_carry and (yi, xi) in prev_tiles:
+                            # continue this tile's own chain: its unblended frames from the previous window
+                            p0, prv = prev_tiles[(yi, xi)]
+                            c_lat = prv[:, :, t0 - p0:t0 - p0 + carry_t].clone()
+                        else:
+                            c_lat = out_v[:, :, t0:t0 + carry_t, y0:y1, x0:x1].clone()
+                        carry = {"resolved_frame_index": 0, "latent": c_lat}
                         a_n = min(done_a - a0, audio_ticks(frames_for_tokens(carry_t)))
                         if a_n > 0:
                             carry["audio_latent"] = out_a[..., a0:a0 + a_n].clone()
@@ -402,12 +412,15 @@ class WindowsWrapper:
                             dc = dc_offset([(rv[..., sel].unsqueeze(-1), acc[..., sel].unsqueeze(-1))])
                             if dc is not None:
                                 rv = rv - dc.view(1, -1, 1, 1, 1)
+                    if own_carry:
+                        cur_tiles[(yi, xi)] = (t0, rv)
                     win_v[:, :, :, y0:y1, x0:x1] += rv * w
                     weight[:, :, :, y0:y1, x0:x1] += w
                     if win_a is None:
                         # one soundtrack: the first tile's (averaging differently generated soundtracks blurs them)
                         win_a = ra.float().cpu()
                 win_v /= weight
+                prev_tiles = cur_tiles
                 if split_space and self.tile_audio == "keep_input":
                     win_a = lat_a[..., a0:a1].float().cpu()
 
