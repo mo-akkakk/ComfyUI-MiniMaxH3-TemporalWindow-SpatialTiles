@@ -1,6 +1,6 @@
-![Minimax H3 Temporal Window & Spatial Tiles node](node.png)
+![Minimax H3 V2V Temporal Window & Spatial Tiles node](node.png)
 
-# Minimax H3 Temporal Window & Spatial Tiles
+# Minimax H3 V2V Temporal Window & Spatial Tiles
 
 by Mohamed ([mo-akkakk](https://registry.comfy.org/publishers/mo-akkakk))
 
@@ -12,6 +12,10 @@ Long and high-resolution video-to-video for the **open-weights MiniMax H3** in n
 Both work in stage 1 (full denoise) and stage 2 (low-denoise refine). Nothing inside the model is patched: every window and tile is an ordinary native H3 run. With one window and no tiles, the output is bit-identical to the plain native workflow.
 
 ## What's new
+
+**1.0.9**
+- The node is renamed *Minimax H3 V2V Temporal Window & Spatial Tiles*, to make clear it follows a reference video (V2V). Saved workflows keep working: only the displayed name changed.
+- Clearer console message: without a reference video, the node now says every window uses the same prompt (which is expected), instead of warning that CLIP is not routed.
 
 **1.0.8**
 - **Exact tile crops (automatic).** When the plate is smaller than the output (always in stage 2, and in stage 1 above about 1 MP), each tile now gets exactly its own area of the plate. Before, the crop was rounded out to a coarse grid, so each tile followed a slightly zoomed or shifted plate and neighbouring tiles disagreed (shifting, doubling or changing content at tile overlaps). When plate and output are the same size, nothing changes.
@@ -54,7 +58,7 @@ Both work in stage 1 (full denoise) and stage 2 (low-denoise refine). Nothing in
 
 ## Install
 
-**ComfyUI Manager / Registry:** search for *Minimax H3 Temporal Window & Spatial Tiles*.
+**ComfyUI Manager / Registry:** search for *Minimax H3 V2V Temporal Window & Spatial Tiles* (published as `comfyui-minimax-h3-temporal-window-spatial-tiles`; before 1.0.9 it was called *Minimax H3 Temporal Window & Spatial Tiles*).
 
 **Manual:**
 ```
@@ -66,7 +70,7 @@ Restart ComfyUI. It needs ComfyUI with native MiniMax H3 support (v0.35.0 or new
 ## Wiring
 
 ```
-UNETLoader -> (shift / LoRA / low-VRAM patches) -> Minimax H3 Temporal Window & Spatial Tiles -> BasicGuider or KSampler
+UNETLoader -> (shift / LoRA / low-VRAM patches) -> Minimax H3 V2V Temporal Window & Spatial Tiles -> BasicGuider or KSampler
 CLIPLoader ------------------------------------> (clip in ... clip out) -> MiniMax H3 Reference to Video
 Your video at output resolution (optional) ----> plate
 VAE (optional, with plate) --------------------> vae
@@ -124,6 +128,7 @@ Everything else is the stock H3 workflow: Reference to Video (with your video as
 ## Tips
 
 - **Write the prompt so it is true for every frame**, because each window reads it on its own.
+- **This node is for video-to-video.** Windows follow the reference video, which tells each window where it is in the shot. With only text or a picture (no `ref_video_0`), every window gets the same prompt and picture, so each window tends to act out the whole prompt again — a long story "restarts" every window. For text- or image-driven generation, describe a continuous state rather than a sequence of events, put a start image in with Add Guide at frame 0 rather than only as `<Picture 1>`, and keep `carry_overlap` on with a larger overlap.
 - **Use H3's reference tags in the prompt:** `<Video 1>`, `<Picture 1>`, `<Audio 1>` (counting from 1 for each kind). These are the labels Qwen actually sees; input names like `ref_video_0` are not.
 - **Avoid thin padding bars.** H3 works on 16 × 16-pixel blocks. If you pad a plate to round its size and the bars are thinner than about 16 px, H3 partly paints over them and the picture comes out slightly squashed and shifted. Use edge padding (repeat the last pixel), bars of 32 px or more, or crop instead of padding.
 - **Stage 2: check your real sigmas.** `BasicScheduler` with `denoise` does not start at that amount of noise: with `linear_quadratic`, denoise 0.4 actually starts at sigma 0.93, almost a full re-generation, and windows and tiles will then disagree. For a refine, start around 0.2–0.45 (e.g. with ManualSigmas).

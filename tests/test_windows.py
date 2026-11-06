@@ -1,4 +1,4 @@
-"""Minimax H3 Temporal Window & Spatial Tiles against ComfyUI's real H3 conditioning, model and samplers (CPU, tiny random DiT).
+"""Minimax H3 V2V Temporal Window & Spatial Tiles against ComfyUI's real H3 conditioning, model and samplers (CPU, tiny random DiT).
 
     python custom_nodes/ComfyUI-MiniMaxH3-TemporalWindow-SpatialTiles/tests/test_windows.py   (from the ComfyUI root)
 """

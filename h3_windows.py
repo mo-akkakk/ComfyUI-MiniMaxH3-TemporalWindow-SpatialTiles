@@ -1,4 +1,4 @@
-"""Minimax H3 Temporal Window & Spatial Tiles (mo-akkakk): temporal windows (stage 1 + 2) and spatial tiles (stage 2), as one model patch.
+"""Minimax H3 V2V Temporal Window & Spatial Tiles (mo-akkakk): temporal windows (stage 1 + 2) and spatial tiles (stage 2), as one model patch.
 
 The patch wraps the guider's sampling run (OUTER_SAMPLE), so it works with KSampler,
 SamplerCustomAdvanced and any guider, and every piece is an ordinary native H3 run:
@@ -442,9 +442,16 @@ class WindowsWrapper:
             for yi, xi in tiles:
                 piece_conds(base_conds, t0, t0 + tn, ys[yi] if split_space else None, xs[xi] if split_space else None,
                             lat_h, lat_w, self.crop_images, None, self.warned, text_cache, self.plate)
+        has_video = any(b.get("kind") in ("video", "video_audio")
+                        for lst in base_conds.values() for c in lst for b in (c.get("minimax_refs") or []))
+        if any(k[0] != "plate" for k in text_cache):
+            note = ", per-piece prompts"
+        elif has_video:
+            note = " (CLIP not routed through the node: every window reads the full-shot prompt)"
+        else:
+            note = " (no reference video: every window uses the same prompt, which is expected)"
         logging.info("MiniMax H3 windows: {} window(s) x {} tile(s), {} frames{}.".format(
-            len(windows), len(tiles), frames_for_tokens(latent_t),
-            ", per-piece prompts" if any(k[0] != "plate" for k in text_cache) else " (CLIP not routed through the node: every window reads the full-shot prompt)"))
+            len(windows), len(tiles), frames_for_tokens(latent_t), note))
         if self.plate is not None and split_space:
             logging.info("MiniMax H3 windows: {} tile plate crop(s) encoded from the full-resolution plate.".format(
                 sum(1 for k, v in text_cache.items() if k[0] == "plate" and v is not None)))

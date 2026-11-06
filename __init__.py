@@ -8,7 +8,7 @@ class MiniMaxH3TemporalWindow(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="MiniMaxH3TemporalWindow",
-            display_name="Minimax H3 Temporal Window & Spatial Tiles (mo-akkakk)",
+            display_name="Minimax H3 V2V Temporal Window & Spatial Tiles (mo-akkakk)",
             category="model/patch/minimax",
             search_aliases=["h3 temporal window", "h3 spatial tiles", "h3 long video", "minimax overlap", "context windows", "mo-akkakk"],
             description="Put after the model, and route the CLIP through it into Reference to Video. "
