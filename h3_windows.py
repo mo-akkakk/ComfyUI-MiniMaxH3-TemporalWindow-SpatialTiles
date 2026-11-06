@@ -24,6 +24,7 @@ native MiniMaxH3ContextWindows support in ComfyUI.
 
 import logging
 import math
+import re
 
 import torch
 
@@ -311,9 +312,21 @@ def tile_keyframes(keyframes, ys, xs):
     return out
 
 
-def piece_text(source, f0, frames, ys, xs, lat_h, lat_w, crop_images, cache):
-    """Re-encode the prompt for one piece: <Video N> trimmed to the window (timestamps from 0), cropped to the tile."""
+def piece_text(source, f0, frames, ys, xs, lat_h, lat_w, crop_images, cache, gen=None):
+    """Re-encode the prompt for one piece: <Video N> trimmed to the window (timestamps from 0), cropped to the tile.
+    With gen (Long Generation node): the window's scheduled prompt text, and Image to Video images only in their window."""
     t0, t1 = f0 / FPS, (f0 + frames) / FPS
+    text = source["text"]
+    if gen is not None:
+        text = gen["compose"](source["text"], f0, frames)
+    clip = source["clip"]
+    if source.get("images") is not None:
+        imgs = source["images"]
+        at = gen["image_frames"].get(id(source)) if gen is not None else None
+        if at is not None and gen["policy"] == "own_window":
+            imgs = [im for im, fi in zip(imgs, at) if fi is None or f0 <= fi < f0 + frames]
+        cond = clip.encode_from_tokens_scheduled(clip.tokenize(text, images=imgs))
+        return cond[0][0], cond[0][1].get("minimax_token_tags")
     items = []
     for it in source["items"]:
         it = dict(it)
@@ -327,8 +340,7 @@ def piece_text(source, f0, frames, ys, xs, lat_h, lat_w, crop_images, cache):
         elif it["type"] == "image" and ys is not None and crop_images:
             it["data"] = crop_pixels(it["data"], ys, xs, lat_h, lat_w)
         items.append(it)
-    clip = source["clip"]
-    cond = clip.encode_from_tokens_scheduled(clip.tokenize(source["text"], minimax_ref_items=items))
+    cond = clip.encode_from_tokens_scheduled(clip.tokenize(text, minimax_ref_items=items))
     return cond[0][0], cond[0][1].get("minimax_token_tags")
 
 
@@ -358,7 +370,7 @@ def plate_refs(orig, refs, k0, k1, ys, xs, lat_h, lat_w, plate, warned, cache):
     return refs
 
 
-def piece_conds(conds, k0, k1, ys, xs, lat_h, lat_w, crop_images, carry, warned, text_cache, plate=None):
+def piece_conds(conds, k0, k1, ys, xs, lat_h, lat_w, crop_images, carry, warned, text_cache, plate=None, gen=None):
     out = {}
     split_space = ys is not None
     f0, frames = frames_for_tokens(k0), frames_for_tokens(k1) - frames_for_tokens(k0)
@@ -385,7 +397,7 @@ def piece_conds(conds, k0, k1, ys, xs, lat_h, lat_w, crop_images, carry, warned,
             if source is not None:
                 key = (id(source), k0, k1, ys, xs)
                 if key not in text_cache:
-                    text_cache[key] = piece_text(source, f0, frames, ys, xs, lat_h, lat_w, crop_images, text_cache)
+                    text_cache[key] = piece_text(source, f0, frames, ys, xs, lat_h, lat_w, crop_images, text_cache, gen)
                 c["cross_attn"], tags = text_cache[key]
                 if tags is not None:
                     c["minimax_token_tags"] = tags
@@ -397,10 +409,110 @@ def piece_conds(conds, k0, k1, ys, xs, lat_h, lat_w, crop_images, carry, warned,
 # ---------------------------------------------------------------- the sampling wrapper
 
 
+TIME = r"(\d+(?:\.\d+)?)\s*(?:s|sec|secs|seconds)?"
+LINE_START = re.compile(r"^" + TIME + r"\s*[:\-]\s*(.*)$", re.IGNORECASE)              # "6s: text"
+LINE_RANGE = re.compile(r"^\[\s*" + TIME + r"\s*-\s*" + TIME + r"\s*\]\s*(.*)$", re.IGNORECASE)  # "[6s-10s] text"
+
+
+def parse_schedule(text):
+    """Prompt schedule as [(start, end or None, text)] sorted by start (seconds at H3's 24 fps).
+    Lines are "6s: text" (until the next line) or "[6s-10s] text" (H3's own timeline format).
+    Lines without a time continue the previous entry; text with no times at all is one entry from 0 s."""
+    entries = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.lower().rstrip(":") == "timeline":
+            continue
+        m = LINE_RANGE.match(line)
+        if m:
+            entries.append([float(m.group(1)), float(m.group(2)), m.group(3).strip()])
+            continue
+        m = LINE_START.match(line)
+        if m:
+            entries.append([float(m.group(1)), None, m.group(2).strip()])
+        elif entries:
+            entries[-1][2] = (entries[-1][2] + "\n" + line).strip()
+        else:
+            entries.append([0.0, None, line])
+    entries = [tuple(e) for e in entries if e[2]]
+    entries.sort(key=lambda e: e[0])
+    return entries
+
+
+def split_timeline(prompt):
+    """A prompt written in H3's timeline style: (scene text without the timeline, timeline entries)."""
+    scene, timeline = [], []
+    for raw in (prompt or "").splitlines():
+        line = raw.strip()
+        m = LINE_RANGE.match(line)
+        if m:
+            timeline.append((float(m.group(1)), float(m.group(2)), m.group(3).strip()))
+        elif line.lower().rstrip(":") == "timeline":
+            continue
+        else:
+            scene.append(raw.rstrip())
+    text = "\n".join(scene)
+    while "\n\n\n" in text:
+        text = text.replace("\n\n\n", "\n\n")
+    return text.strip(), sorted(timeline, key=lambda e: e[0])
+
+
+def fmt_s(x):
+    return ("%.1f" % x).rstrip("0").rstrip(".") + "s"
+
+
+MIN_TAIL_S = 1.0
+
+
+def window_timeline(entries, ws, we, min_tail=MIN_TAIL_S):
+    """Timeline lines for a window [ws, we) seconds, in the window's own time (it starts at 0 s).
+    An action that would only start in the window's last `min_tail` seconds is left to the next window
+    (the previous action runs to the end instead), so H3 does not rush toward it. A sliver (< 0.5 s) of the
+    previous action at the start is dropped too."""
+    spans = []
+    for i, (s, e, text) in enumerate(entries):
+        start = 0.0 if i == 0 else s
+        end = e if e is not None else (entries[i + 1][0] if i + 1 < len(entries) else float("inf"))
+        a, b = max(start, ws), min(end, we)
+        if b - a <= 0.05:
+            continue
+        if spans and we - a < min_tail:
+            spans[-1][1] = max(spans[-1][1], b)
+            continue
+        spans.append([a, b, text])
+    # a leftover sliver of the previous action at the very start (< 0.5 s) is just the carried frames: drop it
+    if len(spans) > 1 and spans[0][1] - spans[0][0] < 0.5:
+        spans[1][0] = spans[0][0]
+        spans = spans[1:]
+    return ["[{}-{}] {}".format(fmt_s(a - ws), fmt_s(b - ws), text) for a, b, text in spans]
+
+
+def window_prompt(scene, lines, continuous):
+    parts = [scene] if scene else []
+    if lines:
+        parts.append("Timeline:\n" + "\n".join(lines))
+    if continuous:
+        parts.append("One continuous shot, no cuts.")
+    return "\n\n".join(parts)
+
+
+def image_frames(n_images, keyframe_indices, total_frames):
+    """Frames that Image to Video's prompt images belong to: [first, last] for two, first or last for one."""
+    last = total_frames - 1
+    if n_images == 2:
+        return [0, last]
+    if n_images == 1:
+        return [0] if (0 in keyframe_indices or last not in keyframe_indices) else [last]
+    return [None] * n_images
+
+
 class WindowsWrapper:
     def __init__(self, window_frames, overlap_frames, carry_overlap, tile_h, tile_w, tile_overlap, crop_images,
                  min_final_frames=0, tile_audio="generate_once", color_match=False, tile_carry="own_tile",
-                 plate=None, vae=None, plate_scale=1.0):
+                 plate=None, vae=None, plate_scale=1.0, schedule=None, image_policy="own_window", continuous=True):
+        self.schedule = schedule          # None = V2V node; a list (maybe empty) = Long Generation node
+        self.image_policy = image_policy
+        self.continuous = continuous
         self.window_frames = window_frames
         self.plate = (plate, vae, plate_scale) if plate is not None and vae is not None else None
         self.tile_carry = tile_carry
@@ -412,6 +524,41 @@ class WindowsWrapper:
         self.tile_h, self.tile_w, self.tile_overlap = tile_h, tile_w, tile_overlap
         self.crop_images = crop_images
         self.warned = set()
+
+    def generation_state(self, windows, conds, latent_t):
+        """Long Generation node: each window's prompt is the scene plus a timeline in the window's own time
+        (H3's native prompt format), and Image to Video's first/last images only in their own window."""
+        sources = [c[TEXT_SOURCE] for lst in conds.values() for c in lst if c.get(TEXT_SOURCE) is not None]
+        if self.schedule and not sources:
+            logging.warning("MiniMax H3 Long Generation: prompt_schedule needs the CLIP routed through this node "
+                            "into Image to Video or Reference to Video; every window uses the full prompt.")
+        total = frames_for_tokens(latent_t)
+        cache = {}
+
+        def compose(prompt, f0, frames):
+            key = (prompt, f0, frames)
+            if key not in cache:
+                scene, timeline = split_timeline(prompt)
+                entries = self.schedule or timeline
+                if not entries:
+                    cache[key] = prompt if not self.continuous else window_prompt(prompt.strip(), [], True)
+                else:
+                    cache[key] = window_prompt(scene, window_timeline(entries, f0 / FPS, (f0 + frames) / FPS), self.continuous)
+            return cache[key]
+
+        for k, (t0, tn) in enumerate(windows):
+            f0, f1 = frames_for_tokens(t0), frames_for_tokens(t0 + tn)
+            for src in sources[:1]:
+                logging.info("MiniMax H3 Long Generation: window {} ({:.1f}-{:.1f} s) prompt:\n{}".format(
+                    k + 1, f0 / FPS, f1 / FPS, compose(src["text"], f0, f1 - f0)))
+        img_at = {}
+        for lst in conds.values():
+            for c in lst:
+                src = c.get(TEXT_SOURCE)
+                if src is not None and src.get("images") is not None:
+                    kfi = {kf["resolved_frame_index"] for kf in (c.get("minimax_keyframes") or [])}
+                    img_at[id(src)] = image_frames(len(src["images"]), kfi, total)
+        return {"compose": compose, "image_frames": img_at, "policy": self.image_policy}
 
     def __call__(self, executor, noise, latent_image, sampler, sigmas, denoise_mask=None, callback=None,
                  disable_pbar=False, seed=None, latent_shapes=None):
@@ -436,12 +583,14 @@ class WindowsWrapper:
         out_v = torch.zeros(vshape, dtype=torch.float32)
         out_a = torch.zeros(ashape, dtype=torch.float32)
 
+        gen = self.generation_state(windows, base_conds, latent_t) if self.schedule is not None else None
+
         # encode every piece's prompt up front, before the DiT is loaded
         text_cache = {}
         for t0, tn in windows:
             for yi, xi in tiles:
                 piece_conds(base_conds, t0, t0 + tn, ys[yi] if split_space else None, xs[xi] if split_space else None,
-                            lat_h, lat_w, self.crop_images, None, self.warned, text_cache, self.plate)
+                            lat_h, lat_w, self.crop_images, None, self.warned, text_cache, self.plate, gen)
         has_video = any(b.get("kind") in ("video", "video_audio")
                         for lst in base_conds.values() for c in lst for b in (c.get("minimax_refs") or []))
         if any(k[0] != "plate" for k in text_cache):
@@ -489,7 +638,7 @@ class WindowsWrapper:
                             carry["audio_latent"] = out_a[..., a0:a0 + a_n].clone()
                     guider.conds = piece_conds(base_conds, t0, t0 + tn, ys[yi] if split_space else None,
                                                xs[xi] if split_space else None, lat_h, lat_w, self.crop_images,
-                                               carry, self.warned, text_cache, self.plate)
+                                               carry, self.warned, text_cache, self.plate, gen)
                     shapes = [torch.Size(vshape[:2] + (tn, y1 - y0, x1 - x0)), torch.Size(tuple(ashape[:-1]) + (a1 - a0,))]
                     p_noise = comfy.utils.pack_latents([noise_v[vs], noise_a[..., a0:a1]])[0]
                     p_lat = comfy.utils.pack_latents([lat_v[vs], lat_a[..., a0:a1]])[0]
@@ -556,9 +705,10 @@ def apply(model, wrapper):
     return m
 
 
-def recording_clip(clip):
+def recording_clip(clip, record_all=False):
     """A CLIP clone that records the prompt and reference items it encodes into the conditioning,
-    so the windows patch can re-encode the prompt per window / tile."""
+    so the windows patch can re-encode the prompt per window / tile.
+    record_all (Long Generation node): also record Image to Video prompts and Reference to Video prompts without references."""
     c = clip.clone()
     pending = {}
 
@@ -567,6 +717,10 @@ def recording_clip(clip):
         items = kwargs.get("minimax_ref_items")
         if items:
             pending[id(tokens)] = (tokens, {"clip": clip, "text": text, "items": list(items)})
+        elif record_all and "minimax_ref_items" in kwargs:
+            pending[id(tokens)] = (tokens, {"clip": clip, "text": text, "items": []})
+        elif record_all and "images" in kwargs:
+            pending[id(tokens)] = (tokens, {"clip": clip, "text": text, "items": [], "images": list(kwargs.get("images") or [])})
         return tokens
 
     def encode_from_tokens_scheduled(tokens, *args, **kwargs):

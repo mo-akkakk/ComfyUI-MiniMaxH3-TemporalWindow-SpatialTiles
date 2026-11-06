@@ -1,6 +1,6 @@
 from comfy_api.latest import ComfyExtension, io
 
-from .h3_windows import WindowsWrapper, apply, recording_clip
+from .h3_windows import WindowsWrapper, apply, parse_schedule, recording_clip
 
 
 class MiniMaxH3TemporalWindow(io.ComfyNode):
@@ -76,9 +76,68 @@ class MiniMaxH3TemporalWindow(io.ComfyNode):
         return io.NodeOutput(apply(model, wrapper), recording_clip(clip) if clip is not None else None)
 
 
+class MiniMaxH3LongGeneration(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3LongGeneration",
+            display_name="Minimax H3 Long Generation (mo-akkakk)",
+            category="model/patch/minimax",
+            search_aliases=["h3 long generation", "h3 prompt schedule", "h3 long t2v", "h3 long i2v", "minimax long video", "mo-akkakk"],
+            description="For text-to-video, image-to-video and first/last-frame generation (no reference video). Put after the model, "
+                        "and route the CLIP through it into Image to Video or Reference to Video. The video is generated as overlapping "
+                        "windows, one after another, each continuing from the previous one, with an optional prompt schedule so the "
+                        "story moves on instead of restarting every window. For video-to-video use the V2V node instead.",
+            inputs=[
+                io.Model.Input("model"),
+                io.Clip.Input("clip", optional=True,
+                              tooltip="Route the CLIP through here into Image to Video or Reference to Video. Needed for the prompt schedule "
+                                      "and for keeping the first/last image only in its own window."),
+                io.String.Input("prompt_schedule", multiline=True, default="",
+                                tooltip="Optional timeline for the whole video, one line per action, in seconds (H3 runs at 24 fps):\n"
+                                        "0s: he walks along the street\n6s: he stops at the bakery window\n"
+                                        "or H3's own format: [0s-6s] he walks along the street\n"
+                                        "Write the look, character and setting once in the conditioning node's prompt; it is kept for "
+                                        "every window. Each window then gets that scene plus the part of this timeline it covers, "
+                                        "re-timed so the window starts at 0 s. Empty = a 'Timeline:' written in the conditioning "
+                                        "prompt is re-timed the same way; with none, every window uses the prompt as it is."),
+                io.Boolean.Input("continuous_shot", default=True,
+                                 tooltip="Add 'One continuous shot, no cuts.' to every window's prompt, so H3 continues the carried "
+                                         "frames instead of cutting to a new shot when the action changes. Turn off if you want cuts."),
+                io.Int.Input("window_frames", default=124, min=22, max=3600, step=17,
+                             tooltip="Frames per window (17k+5). 124 = 5.2 s. Keep it inside what works natively for you."),
+                io.Int.Input("overlap_frames", default=39, min=5, max=1000, step=17,
+                             tooltip="Frames shared by neighbouring windows (5, 22, 39...). Without a reference video the overlap is "
+                                     "what carries the motion forward, so use more than for V2V (39 recommended)."),
+                io.Boolean.Input("short_final_window", default=False,
+                                 tooltip="Let the last window be shorter than window_frames instead of pulling it back to full length."),
+                io.Int.Input("min_final_window_frames", default=22, min=5, max=3600, step=17,
+                             tooltip="With short_final_window on: the last window is never shorter than this (17k+5: 5, 22, 39, 56...)."),
+                io.Boolean.Input("carry_overlap", default=True,
+                                 tooltip="Each window starts from the previous window's finished overlap frames (video and audio). "
+                                         "Keep it on: without it, windows are unrelated clips."),
+                io.Combo.Input("first_last_images", options=["own_window", "all_windows"], default="own_window",
+                               tooltip="Image to Video's first/last frame images in the prompt. own_window: the first image is only in the "
+                                       "first window's prompt and the last image only in the last window's (matches where they are "
+                                       "used as frames). all_windows: every window's prompt shows them (can help keep a character's "
+                                       "look, but later windows may drift back toward the first frame)."),
+            ],
+            outputs=[io.Model.Output(), io.Clip.Output()],
+        )
+
+    @classmethod
+    def execute(cls, model, prompt_schedule, continuous_shot, window_frames, overlap_frames, short_final_window,
+                min_final_window_frames, carry_overlap, first_last_images="own_window", clip=None) -> io.NodeOutput:
+        wrapper = WindowsWrapper(window_frames, overlap_frames, carry_overlap, 0, 0, 0, False,
+                                 min_final_window_frames if short_final_window else 0,
+                                 schedule=parse_schedule(prompt_schedule), image_policy=first_last_images,
+                                 continuous=continuous_shot)
+        return io.NodeOutput(apply(model, wrapper), recording_clip(clip, record_all=True) if clip is not None else None)
+
+
 class MiniMaxH3WindowExtension(ComfyExtension):
     async def get_node_list(self):
-        return [MiniMaxH3TemporalWindow]
+        return [MiniMaxH3TemporalWindow, MiniMaxH3LongGeneration]
 
 
 async def comfy_entrypoint() -> MiniMaxH3WindowExtension:

@@ -465,6 +465,95 @@ def test_full_res_plate(model):
     check("plate_scale 0.5: each tile's plate piece is half the tile size (a quarter of the reference tokens)", ok)
 
 
+class GenClip:
+    """Text-aware Qwen stand-in for the Long Generation node: records the text and images of every encode."""
+
+    def __init__(self, log=None):
+        self.log = log if log is not None else []
+
+    def clone(self):
+        return GenClip(self.log)
+
+    def tokenize(self, text, return_word_ids=False, minimax_ref_items=None, images=None):
+        return {"text": text, "images": list(images or []), "items": minimax_ref_items or []}
+
+    def encode_from_tokens_scheduled(self, tokens):
+        self.log.append((tokens["text"], tokens["images"], tokens["items"]))
+        key = sum(ord(ch) for ch in tokens["text"]) + sum(float(im.mean()) for im in tokens["images"])
+        g = torch.Generator().manual_seed(int(key * 1000) % (2 ** 31))
+        n = 8 + 2 * len(tokens["images"])
+        return [[torch.randn(1, n, TEXT_DIM, generator=g), {"minimax_token_tags": torch.ones(1, n, dtype=torch.long)}]]
+
+
+def test_schedule_parsing():
+    e = hw.parse_schedule("0s: a man walks in\n6s: he sits down\nslowly\n# note\n[12.5s-15s] he stands up")
+    ok = e == [(0.0, None, "a man walks in"), (6.0, None, "he sits down\nslowly"), (12.5, 15.0, "he stands up")]
+    ok &= hw.parse_schedule("just one prompt") == [(0.0, None, "just one prompt")] and hw.parse_schedule("  ") == []
+    lines = hw.window_timeline(e, 4.0, 9.2)
+    ok &= lines == ["[0s-2s] a man walks in", "[2s-5.2s] he sits down\nslowly"]
+    ok &= hw.window_timeline(e, 12.0, 17.2) == ["[0s-0.5s] he sits down\nslowly", "[0.5s-3s] he stands up"]
+    # an action starting in the window's last second waits for the next window
+    ok &= hw.window_timeline(e, 0.0, 6.5) == ["[0s-6.5s] a man walks in"]
+    ok &= hw.window_timeline(e, 4.9, 10.1) == ["[0s-1.1s] a man walks in", "[1.1s-5.2s] he sits down\nslowly"]
+    ok &= hw.window_timeline(e, 5.8, 11.0) == ["[0s-5.2s] he sits down\nslowly"]
+    scene, tl = hw.split_timeline("Snowy street look.\n\nTimeline:\n[0s-1s] walks\n[1s-2.5s] stops\n\nAudio: wind.")
+    ok &= scene == "Snowy street look.\n\nAudio: wind." and tl == [(0.0, 1.0, "walks"), (1.0, 2.5, "stops")]
+    check("prompt schedule: '6s:' and '[6s-10s]' lines, re-timed per window, no action announced in a window's last second; "
+          "a Timeline in the prompt is found", ok)
+
+
+def test_long_generation(model):
+    W, H, N = 384, 256, 175
+    first, last = torch.full((1, H, W, 3), 0.2), torch.full((1, H, W, 3), 0.8)
+    sched = "0s: walks in\n2s: sits down\n4.5s: looks out"
+    entries = hw.parse_schedule(sched)
+    for policy in ("own_window", "all_windows"):
+        log = []
+        m, c = pack.MiniMaxH3LongGeneration.execute(model, sched, True, 56, 22, False, 22, True, policy, clip=GenClip(log)).result
+        pos, lat = h3.MiniMaxH3ImageToVideo.execute(c, FakeVAE(), "A snowy street at dusk.", W, H, N, first_frame=first, last_frame=last).result[:2]
+        n0 = len(log)
+        sigmas = comfy.samplers.calculate_sigmas(m.get_model_object("model_sampling"), "simple", 2)
+        out = run(m, pos, lat, sigmas)[0]["samples"].unbind()
+        lat_t = lat["samples"].unbind()[0].shape[2]
+        windows = hw.plan_windows(lat_t, 56, 22)
+        enc = log[n0:]
+        total = hw.frames_for_tokens(lat_t)
+        ok = len(windows) >= 3 and len(enc) == len(windows) and bool(torch.isfinite(out[0]).all())
+        for k, (t0, tn) in enumerate(windows):
+            f0, f1 = hw.frames_for_tokens(t0), hw.frames_for_tokens(t0 + tn)
+            text, imgs, _ = enc[k]
+            want = hw.window_prompt("A snowy street at dusk.", hw.window_timeline(entries, f0 / 24, f1 / 24), True)
+            ok &= text == want and text.startswith("A snowy street at dusk.\n\nTimeline:\n[0s-") and text.endswith("One continuous shot, no cuts.")
+            if policy == "own_window":
+                want_imgs = [v for v, fi in ((0.2, 0), (0.8, total - 1)) if f0 <= fi < f1]
+            else:
+                want_imgs = [0.2, 0.8]
+            ok &= [round(float(im.mean()), 1) for im in imgs] == want_imgs
+        check("long generation ({}): {} windows each get the scene + their own re-timed timeline; first/last images {}".format(
+            policy, len(windows), "only in their own window" if policy == "own_window" else "in every window"), bool(ok))
+        if policy == "own_window":
+            print("    e.g. window 2 prompt:", repr(enc[1][0]))
+    log = []
+    m, c = pack.MiniMaxH3LongGeneration.execute(model, "", False, 56, 22, False, 22, True, "own_window", clip=GenClip(log)).result
+    prompt = "Look: snowy dusk.\nTimeline:\n[0s-3s] walks\n[3s-7.3s] stops"
+    pos, lat = h3.MiniMaxH3ImageToVideo.execute(c, FakeVAE(), prompt, W, H, N, first_frame=first).result[:2]
+    n0 = len(log)
+    run(m, pos, lat, comfy.samplers.calculate_sigmas(m.get_model_object("model_sampling"), "simple", 2))
+    enc = log[n0:]
+    windows = hw.plan_windows(lat["samples"].unbind()[0].shape[2], 56, 22)
+    ok = len(enc) == len(windows) and len(enc[0][1]) == 1 and all(len(e[1]) == 0 for e in enc[1:])
+    f0 = hw.frames_for_tokens(windows[1][0]) / 24
+    ok &= enc[1][0] == "Look: snowy dusk.\n\nTimeline:\n" + "\n".join(hw.window_timeline(hw.split_timeline(prompt)[1], f0, f0 + 56 / 24))
+    check("long generation without a schedule: a Timeline in the prompt is re-timed per window; the first image only in window 1", ok)
+    log = []
+    m, c = pack.MiniMaxH3LongGeneration.execute(model, "", False, 56, 22, False, 22, True, "own_window", clip=GenClip(log)).result
+    pos, lat = h3.MiniMaxH3ImageToVideo.execute(c, FakeVAE(), "plain prompt", W, H, N).result[:2]
+    n0 = len(log)
+    run(m, pos, lat, comfy.samplers.calculate_sigmas(m.get_model_object("model_sampling"), "simple", 2))
+    check("long generation, plain prompt, continuous_shot off: every window uses the prompt unchanged",
+          len(log) > n0 and all(e[0] == "plain prompt" for e in log[n0:]))
+
+
 if __name__ == "__main__":
 
 
@@ -472,6 +561,7 @@ if __name__ == "__main__":
     test_short_final_window_plan()
     test_guide_helpers()
     test_exact_crop()
+    test_schedule_parsing()
     with tempfile.TemporaryDirectory() as d:
         model = tiny_model(os.path.join(d, "tiny_h3.safetensors"))
         test_one_window_is_native(model)
@@ -483,5 +573,6 @@ if __name__ == "__main__":
         test_tile_audio(model)
         test_tile_carry(model)
         test_full_res_plate(model)
+        test_long_generation(model)
     print("\n{} failure(s)".format(len(FAILS)))
     sys.exit(1 if FAILS else 0)
