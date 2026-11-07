@@ -461,30 +461,18 @@ def fmt_s(x):
     return ("%.1f" % x).rstrip("0").rstrip(".") + "s"
 
 
-MIN_TAIL_S = 1.0
-
-
-def window_timeline(entries, ws, we, min_tail=MIN_TAIL_S):
+def window_timeline(entries, ws, we):
     """Timeline lines for a window [ws, we) seconds, in the window's own time (it starts at 0 s).
-    An action that would only start in the window's last `min_tail` seconds is left to the next window
-    (the previous action runs to the end instead), so H3 does not rush toward it. A sliver (< 0.5 s) of the
-    previous action at the start is dropped too."""
-    spans = []
+    Every action that falls inside the window is listed, even one that starts near its end, so H3 sees
+    what is coming and sets it up inside the same shot instead of cutting to it in the next window."""
+    lines = []
     for i, (s, e, text) in enumerate(entries):
         start = 0.0 if i == 0 else s
         end = e if e is not None else (entries[i + 1][0] if i + 1 < len(entries) else float("inf"))
         a, b = max(start, ws), min(end, we)
-        if b - a <= 0.05:
-            continue
-        if spans and we - a < min_tail:
-            spans[-1][1] = max(spans[-1][1], b)
-            continue
-        spans.append([a, b, text])
-    # a leftover sliver of the previous action at the very start (< 0.5 s) is just the carried frames: drop it
-    if len(spans) > 1 and spans[0][1] - spans[0][0] < 0.5:
-        spans[1][0] = spans[0][0]
-        spans = spans[1:]
-    return ["[{}-{}] {}".format(fmt_s(a - ws), fmt_s(b - ws), text) for a, b, text in spans]
+        if b - a > 0.05:
+            lines.append("[{}-{}] {}".format(fmt_s(a - ws), fmt_s(b - ws), text))
+    return lines
 
 
 def window_prompt(scene, lines, continuous):

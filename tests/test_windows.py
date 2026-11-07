@@ -492,13 +492,11 @@ def test_schedule_parsing():
     lines = hw.window_timeline(e, 4.0, 9.2)
     ok &= lines == ["[0s-2s] a man walks in", "[2s-5.2s] he sits down\nslowly"]
     ok &= hw.window_timeline(e, 12.0, 17.2) == ["[0s-0.5s] he sits down\nslowly", "[0.5s-3s] he stands up"]
-    # an action starting in the window's last second waits for the next window
-    ok &= hw.window_timeline(e, 0.0, 6.5) == ["[0s-6.5s] a man walks in"]
-    ok &= hw.window_timeline(e, 4.9, 10.1) == ["[0s-1.1s] a man walks in", "[1.1s-5.2s] he sits down\nslowly"]
-    ok &= hw.window_timeline(e, 5.8, 11.0) == ["[0s-5.2s] he sits down\nslowly"]
+    # every action inside the window is listed, even one starting near its end
+    ok &= hw.window_timeline(e, 0.0, 6.5) == ["[0s-6s] a man walks in", "[6s-6.5s] he sits down\nslowly"]
     scene, tl = hw.split_timeline("Snowy street look.\n\nTimeline:\n[0s-1s] walks\n[1s-2.5s] stops\n\nAudio: wind.")
     ok &= scene == "Snowy street look.\n\nAudio: wind." and tl == [(0.0, 1.0, "walks"), (1.0, 2.5, "stops")]
-    check("prompt schedule: '6s:' and '[6s-10s]' lines, re-timed per window, no action announced in a window's last second; "
+    check("prompt schedule: '6s:' and '[6s-10s]' lines, re-timed per window, every action inside a window listed; "
           "a Timeline in the prompt is found", ok)
 
 

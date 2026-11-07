@@ -15,6 +15,9 @@ The pack also has a second node, **Minimax H3 Long Generation**, for long text-t
 
 ## What's new
 
+**1.1.1**
+- Long Generation: every action that falls inside a window is listed in that window's timeline again, even one that starts near the window's end. Holding those back (1.1.0) made the next window jump to the new action, which caused more cuts; listing them lets H3 set the action up inside the same shot. Actions may start a little earlier than scheduled — space your timeline a bit more if they do.
+
 **1.1.0**
 - New node: **Minimax H3 Long Generation (mo-akkakk)** for long text-to-video, image-to-video and first/last-frame generation. Windows are sampled one after another, each continuing from the previous one's finished frames, and an optional `prompt_schedule` (or a `Timeline:` in your prompt) gives every window the scene plus its own part of the story, re-timed in H3's native timeline format. See [Long Generation node](#long-generation-node-text--image-to-video).
 - The V2V node is unchanged.
@@ -192,7 +195,7 @@ You can also write the timeline H3's own way, `[5s-10s] he stops at the bakery w
 **Rules of thumb:**
 - **The scene says *where* everything is; the timeline says *when* things happen.** Put every place and object the story needs into the scene (the bakery, the door…). If an action needs something that is not in the shot yet, H3 tends to cut to it.
 - **Describe the character the same way throughout** — the scene does that for you, so keep identity details out of the timeline.
-- **One small action per line**, each continuing from the previous one. Give each action a few seconds; actions closer together than about one window are compressed.
+- **One small action per line**, each continuing from the previous one. Give each action a few seconds. H3 sees the next action coming and may start it a little early — if it does, space the times further apart.
 - **Reference to Video works too:** put the tags in the scene (`<Picture 1> is the man, <Picture 2> is the bakery`), and use them in the timeline if you like. Pictures and reference audio are shown to every window. For a soundtrack that must play in time across the video, add it with Add Guide (audio) at frame 0 instead of as reference audio.
 
 ### Settings
