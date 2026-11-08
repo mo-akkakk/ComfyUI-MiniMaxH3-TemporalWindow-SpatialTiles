@@ -15,6 +15,10 @@ The pack also has a second node, **Minimax H3 Long Generation**, for long text-t
 
 ## What's new
 
+**1.1.2**
+- Much faster start with tiles + `plate`: all plate pieces are now encoded first (video VAE), then all prompts (text encoder). Before, the two big models were swapped onto the GPU once per window × tile, which on long, tiled shots could take a very long time before the first sampling step.
+- Progress before sampling: the console shows `encoding plate piece 3/12 …` / `encoding prompt 5/12 …`, and the node's progress bar moves, so a long start no longer looks stuck.
+
 **1.1.1**
 - Long Generation: every action that falls inside a window is listed in that window's timeline again, even one that starts near the window's end. Holding those back (1.1.0) made the next window jump to the new action, which caused more cuts; listing them lets H3 set the action up inside the same shot. Actions may start a little earlier than scheduled — space your timeline a bit more if they do.
 
@@ -132,7 +136,7 @@ Everything else is the stock H3 workflow: Reference to Video (with your video as
 - `plate` must be **the same clip**: same first frame, same frames, at least as long — just at higher resolution.
 - Feed it at about **your output resolution**. A 4K plate works but takes a lot of RAM (about 100 MB per frame).
 
-**Cost.** Each tile's plate piece is encoded once with the VAE before sampling, and bigger plate pieces mean more reference tokens at every sampling step. At `plate_scale` 1.0, expect a run to take about 1.6× as long as without the plate (in testing: 1330 s vs 812 s); lower `plate_scale` to get most of that time back.
+**Cost.** Before the first sampling step, the node encodes every window × tile once: first all plate pieces, then all prompts (the console shows the progress). With many tiles and windows this takes a while. Each tile's plate piece is encoded once with the VAE before sampling, and bigger plate pieces mean more reference tokens at every sampling step. At `plate_scale` 1.0, expect a run to take about 1.6× as long as without the plate (in testing: 1330 s vs 812 s); lower `plate_scale` to get most of that time back.
 
 ## Tips
 

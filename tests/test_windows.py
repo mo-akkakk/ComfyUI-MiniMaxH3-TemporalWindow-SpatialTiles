@@ -451,6 +451,21 @@ def test_full_res_plate(model):
     check("full-res plate: every tile's <Video 1> is encoded from its exact crop of the plate ({} pieces sampled)".format(len(pieces)),
           bool(ok and ok_shape and ok_px))
 
+    # encoding order: every plate piece (VAE) first, then every prompt (text encoder) - no model ping-pong
+    order = []
+    o_pl, o_pt = hw.plate_latent, hw.piece_text
+    hw.plate_latent = lambda *a, **k: (order.append("vae"), o_pl(*a, **k))[1]
+    hw.piece_text = lambda *a, **k: (order.append("text"), o_pt(*a, **k))[1]
+    try:
+        m, c = patch(model, FakeClip(), frames=73, overlap=22, tiles=True, tw=tw, th=th, tov=tov, plate=plate2x, vae=FakeVAE())
+        pos, lat = conditioning(c, plate, ref, W, H, N, guide=False)
+        run(m, pos, lat, sigmas)
+    finally:
+        hw.plate_latent, hw.piece_text = o_pl, o_pt
+    n_v, n_t = order.count("vae"), order.count("text")
+    check("encoding order: all {} plate pieces, then all {} prompts (one model switch, not one per piece)".format(n_v, n_t),
+          n_v > 1 and n_t > 1 and order == ["vae"] * n_v + ["text"] * n_t)
+
     m, c = patch(model, FakeClip(), frames=73, overlap=22, tiles=True, tw=tw, th=th, tov=tov, plate=plate2x, vae=FakeVAE(), plate_scale=0.5)
     pos, lat = conditioning(c, plate, ref, W, H, N, guide=False)
     seen.clear()

@@ -370,7 +370,8 @@ def plate_refs(orig, refs, k0, k1, ys, xs, lat_h, lat_w, plate, warned, cache):
     return refs
 
 
-def piece_conds(conds, k0, k1, ys, xs, lat_h, lat_w, crop_images, carry, warned, text_cache, plate=None, gen=None):
+def piece_conds(conds, k0, k1, ys, xs, lat_h, lat_w, crop_images, carry, warned, text_cache, plate=None, gen=None,
+                text=True):
     out = {}
     split_space = ys is not None
     f0, frames = frames_for_tokens(k0), frames_for_tokens(k1) - frames_for_tokens(k0)
@@ -393,7 +394,7 @@ def piece_conds(conds, k0, k1, ys, xs, lat_h, lat_w, crop_images, carry, warned,
                 kfs = kfs + [carry]
             if kfs or "minimax_keyframes" in c:
                 c["minimax_keyframes"] = kfs
-            source = c.get(TEXT_SOURCE)
+            source = c.get(TEXT_SOURCE) if text else None
             if source is not None:
                 key = (id(source), k0, k1, ys, xs)
                 if key not in text_cache:
@@ -573,12 +574,37 @@ class WindowsWrapper:
 
         gen = self.generation_state(windows, base_conds, latent_t) if self.schedule is not None else None
 
-        # encode every piece's prompt up front, before the DiT is loaded
+        # Encode everything up front, before the DiT is loaded, one model at a time: first every plate piece
+        # (video VAE), then every prompt (text encoder). Interleaving them made the two big models swap for
+        # every piece.
         text_cache = {}
-        for t0, tn in windows:
-            for yi, xi in tiles:
+        pieces = [(t0, tn, yi, xi) for t0, tn in windows for yi, xi in tiles]
+        has_source = any(c.get(TEXT_SOURCE) is not None for lst in base_conds.values() for c in lst)
+        stages = []
+        if self.plate is not None and split_space:
+            stages.append(("plate piece", False))
+        if has_source:
+            stages.append(("prompt", True))
+        total_jobs = len(pieces) * len(stages)
+        pbar = comfy.utils.ProgressBar(total_jobs) if total_jobs and len(pieces) > 1 else None
+        done_jobs = 0
+        for label, with_text in stages:
+            for i, (t0, tn, yi, xi) in enumerate(pieces):
+                comfy.model_management.throw_exception_if_processing_interrupted()
+                if len(pieces) > 1:
+                    logging.info("MiniMax H3 windows: encoding {} {}/{} (window {}/{}, tile {}/{})".format(
+                        label, i + 1, len(pieces), windows.index((t0, tn)) + 1, len(windows),
+                        tiles.index((yi, xi)) + 1, len(tiles)))
                 piece_conds(base_conds, t0, t0 + tn, ys[yi] if split_space else None, xs[xi] if split_space else None,
-                            lat_h, lat_w, self.crop_images, None, self.warned, text_cache, self.plate, gen)
+                            lat_h, lat_w, self.crop_images, None, self.warned, text_cache, self.plate, gen, text=with_text)
+                done_jobs += 1
+                if pbar is not None:
+                    pbar.update_absolute(done_jobs, total_jobs)
+        if not stages:
+            for t0, tn in windows:
+                for yi, xi in tiles:
+                    piece_conds(base_conds, t0, t0 + tn, ys[yi] if split_space else None, xs[xi] if split_space else None,
+                                lat_h, lat_w, self.crop_images, None, self.warned, text_cache, self.plate, gen)
         has_video = any(b.get("kind") in ("video", "video_audio")
                         for lst in base_conds.values() for c in lst for b in (c.get("minimax_refs") or []))
         if any(k[0] != "plate" for k in text_cache):
