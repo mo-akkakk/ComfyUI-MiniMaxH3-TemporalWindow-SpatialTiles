@@ -152,5 +152,8 @@ class MiniMaxH3WindowExtension(ComfyExtension):
         return [MiniMaxH3TemporalWindow, MiniMaxH3LongGeneration]
 
 
+WEB_DIRECTORY = "./js"  # tile_mode_ui.js: shows only the tile settings of the chosen tile_mode
+
+
 async def comfy_entrypoint() -> MiniMaxH3WindowExtension:
     return MiniMaxH3WindowExtension()

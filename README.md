@@ -15,6 +15,9 @@ The pack also has a second node, **Minimax H3 Long Generation**, for long text-t
 
 ## What's new
 
+**1.1.4**
+- The V2V node now only shows the tile settings of the chosen `tile_mode`: `tile_width` / `tile_height` for `tile_size`, `tiles_across` / `tiles_down` for `tile_count`. The others are hidden, not removed, so saved workflows keep all their values.
+
 **1.1.3**
 - New `tile_mode` for the V2V node: `tile_size` (as before: set `tile_width` / `tile_height` in pixels) or `tile_count` (set `tiles_across` × `tiles_down`; the tile size follows from the frame size). Both use `tile_overlap`. The new settings are at the bottom of the node, so saved workflows keep their values.
 
