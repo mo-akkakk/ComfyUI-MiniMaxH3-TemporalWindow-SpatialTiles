@@ -40,8 +40,6 @@ TEXT_SOURCE = "minimax_h3_text_source"
 CLIP_TOKENS = 5
 FPS = 24
 COLOR_CLAMP = 0.05
-ANCHOR = "minimax_h3_anchor"
-ANCHOR_TEXT = "Every frame keeps the look of <Picture {}>: the same lighting, weather, colours and styling."
 
 
 def frames_for_tokens(t):
@@ -256,7 +254,7 @@ def window_refs(refs, k0, k1):
 def tile_refs(refs, ys, xs, lat_h, lat_w, crop_images):
     out = []
     for blk in refs:
-        if blk["kind"] not in ("video", "video_audio") and not ((crop_images or blk.get(ANCHOR)) and blk["kind"] == "image"):
+        if blk["kind"] not in ("video", "video_audio") and not (crop_images and blk["kind"] == "image"):
             out.append(blk)
             continue
         new = dict(blk)
@@ -360,7 +358,6 @@ def piece_text(source, f0, frames, ys, xs, lat_h, lat_w, crop_images, cache, gen
     items = []
     for it in source["items"]:
         it = dict(it)
-        anchor = it.pop(ANCHOR, False)  # style_anchor's frame of the shot: cropped to the tile like the shot
         if it["type"] == "video":
             ts = it.get("timestamps") or [i / 2.0 for i in range(it["data"].shape[0])]
             keep = [i for i, t in enumerate(ts) if t0 <= t < t1] or [min(range(len(ts)), key=lambda i: abs(ts[i] - t0))]
@@ -368,7 +365,7 @@ def piece_text(source, f0, frames, ys, xs, lat_h, lat_w, crop_images, cache, gen
             it["timestamps"] = [ts[i] - ts[keep[0]] for i in keep]
             if ys is not None:
                 it["data"] = crop_pixels(it["data"], ys, xs, lat_h, lat_w)
-        elif it["type"] == "image" and ys is not None and (crop_images or anchor):
+        elif it["type"] == "image" and ys is not None and crop_images:
             it["data"] = crop_pixels(it["data"], ys, xs, lat_h, lat_w)
         items.append(it)
     cond = clip.encode_from_tokens_scheduled(clip.tokenize(text, minimax_ref_items=items))
@@ -530,13 +527,12 @@ class WindowsWrapper:
     def __init__(self, window_frames, overlap_frames, carry_overlap, tile_h, tile_w, tile_overlap, crop_images,
                  min_final_frames=0, tile_audio="generate_once", color_match=False, tile_carry="own_tile",
                  plate=None, vae=None, plate_scale=1.0, schedule=None, image_policy="own_window", continuous=True,
-                 tile_counts=None, carry_frames=0, tile_sync=False, style_anchor=False):
+                 tile_counts=None, carry_frames=0):
         self.schedule = schedule          # None = V2V node; a list (maybe empty) = Long Generation node
         self.image_policy = image_policy
         self.continuous = continuous
         self.window_frames = window_frames
         self.plate = (plate, vae, plate_scale) if plate is not None and vae is not None else None
-        self.vae = vae
         self.tile_carry = tile_carry
         self.tile_audio = tile_audio
         self.color_match = color_match
@@ -547,8 +543,7 @@ class WindowsWrapper:
         self.tile_counts = tile_counts    # (across, down): tile size follows from the frame size at sampling time
         self.carry_frames = carry_frames  # 0 = the whole overlap; else only the last carry_frames of it guide the window
         self.crop_images = crop_images
-        self.tile_sync = tile_sync        # tiles take every sampling step together, overlaps averaged each step
-        self.style_anchor = style_anchor  # windows after the first also see window 1's first frame as a <Picture>
+        self.tile_sync = tile_carry == "sync"  # tiles take every sampling step together, overlaps averaged each step
         self.warned = set()
 
     def generation_state(self, windows, conds, latent_t):
@@ -585,29 +580,6 @@ class WindowsWrapper:
                     kfi = {kf["resolved_frame_index"] for kf in (c.get("minimax_keyframes") or [])}
                     img_at[id(src)] = image_frames(len(src["images"]), kfi, total)
         return {"compose": compose, "image_frames": img_at, "policy": self.image_policy}
-
-    def add_style_anchor(self, conds, z):
-        """style_anchor: add the finished first frame (latent z, one token) as one more <Picture> reference to the
-        prompts that carry reference items, with a line asking every frame to keep its look. Motion still comes
-        from <Video 1>; the picture only holds lighting, weather, colours and styling. Returns True if added."""
-        px = self.vae.decode(z)
-        px = px.reshape((-1,) + tuple(px.shape[-3:]))[:1].float().cpu()
-        added = False
-        for lst in conds.values():
-            for c in lst:
-                src = c.get(TEXT_SOURCE)
-                if src is None or not src.get("items") or src.get("images") is not None:
-                    continue
-                n_img = sum(1 for it in src["items"] if it["type"] == "image")
-                items = list(src["items"])
-                items.insert(n_img, {"type": "image", "data": px, ANCHOR: True})
-                c[TEXT_SOURCE] = dict(src, items=items, text=src["text"].rstrip() + " " + ANCHOR_TEXT.format(n_img + 1))
-                refs = list(c.get("minimax_refs") or [])
-                n_blk = sum(1 for b in refs if b["kind"] == "image")
-                refs.insert(n_blk, {"kind": "image", "latent_h": z.shape[-2], "latent_w": z.shape[-1], "latent": z, ANCHOR: True})
-                c["minimax_refs"] = refs
-                added = True
-        return added
 
     def sample_window_sync(self, executor, guider, tile_conds, tile_shapes, boxes, weights, p_noise, p_lat, p_mask,
                            shapes, sampler, sigmas, disable_pbar, seed):
@@ -706,14 +678,6 @@ class WindowsWrapper:
         out_a = torch.zeros(ashape, dtype=torch.float32)
 
         gen = self.generation_state(windows, base_conds, latent_t) if self.schedule is not None else None
-        anchor = self.style_anchor and len(windows) > 1 and self.schedule is None
-        if anchor and self.vae is None:
-            anchor = False
-            logging.warning("MiniMax H3 windows: style_anchor needs the vae input connected; running without it.")
-        if anchor and not any((c.get(TEXT_SOURCE) or {}).get("items") for lst in base_conds.values() for c in lst):
-            anchor = False
-            logging.warning("MiniMax H3 windows: style_anchor needs the CLIP routed through this node into "
-                            "Reference to Video; running without it.")
 
         # Encode everything up front, before the DiT is loaded, one model at a time: first every plate piece
         # (video VAE), then every prompt (text encoder). Interleaving them made the two big models swap for
@@ -732,9 +696,6 @@ class WindowsWrapper:
         for label, with_text in stages:
             for i, (t0, tn, yi, xi) in enumerate(pieces):
                 comfy.model_management.throw_exception_if_processing_interrupted()
-                if with_text and anchor and t0 > 0:
-                    done_jobs += 1  # encoded after window 1, with the anchor picture
-                    continue
                 if len(pieces) > 1:
                     logging.info("MiniMax H3 windows: encoding {} {}/{} (window {}/{}, tile {}/{})".format(
                         label, i + 1, len(pieces), windows.index((t0, tn)) + 1, len(windows),
@@ -874,15 +835,6 @@ class WindowsWrapper:
                     out_a[..., a0:a0 + ov_a] = out_a[..., a0:a0 + ov_a] * (1 - fade) + win_a[..., :ov_a] * fade
                 out_a[..., a0 + ov_a:a1] = win_a[..., ov_a:]
                 done_t, done_a = max(done_t, t0 + tn), max(done_a, a1)
-                if anchor and wi == 0:
-                    if self.add_style_anchor(base_conds, out_v[:, :, :1].clone()):
-                        later = [p for p in pieces if p[0] > 0]
-                        for i, (p0, pn, yi, xi) in enumerate(later):
-                            comfy.model_management.throw_exception_if_processing_interrupted()
-                            logging.info("MiniMax H3 windows: style_anchor: encoding prompt {}/{}".format(i + 1, len(later)))
-                            piece_conds(base_conds, p0, p0 + pn, ys[yi] if split_space else None,
-                                        xs[xi] if split_space else None, lat_h, lat_w, self.crop_images, None,
-                                        self.warned, text_cache, self.plate, gen)
                 logging.info("MiniMax H3 windows: window {}/{} done (frames {}-{}, {} frames carried in).".format(
                     wi + 1, len(windows), frames_for_tokens(t0), frames_for_tokens(t0 + tn) - 1,
                     frames_for_tokens(carry_t) if carry_t else 0))

@@ -111,11 +111,11 @@ def run(model, pos, lat, sigmas, seed=3):
 
 def patch(model, clip, frames=124, overlap=22, tiles=False, tw=960, th=544, tov=256, short_final=False, min_final=22,
           tile_audio="generate_once", color_match=False, tile_carry="own_tile", plate=None, vae=None, plate_scale=1.0,
-          tile_mode="tile_size", across=2, down=2, carry_frames=None, tile_sync=False, style_anchor=False):
+          tile_mode="tile_size", across=2, down=2, carry_frames=None):
     return pack.MiniMaxH3TemporalWindow.execute(
         model=model, temporal_windows=frames > 0, window_frames=max(frames, 22), overlap_frames=overlap,
         short_final_window=short_final, min_final_window_frames=min_final, carry_overlap=True,
-        carry_frames=overlap if carry_frames is None else carry_frames, style_anchor=style_anchor, tile_sync=tile_sync,
+        carry_frames=overlap if carry_frames is None else carry_frames, 
         spatial_tiles=tiles, tile_mode=tile_mode, tile_width=tw, tile_height=th, tiles_across=across, tiles_down=down,
         tile_overlap=tov, tile_carry=tile_carry, tile_audio=tile_audio, crop_ref_images_per_tile=True,
         color_match=color_match, plate_scale=plate_scale, clip=clip, plate=plate, vae=vae).result
@@ -644,7 +644,8 @@ def test_tile_sync(model):
     steps = 3
     outs = {}
     for sync in (False, True):
-        m, c = patch(model, FakeClip(), frames=73, overlap=22, tiles=True, tw=tw, th=th, tov=tov, tile_sync=sync)
+        m, c = patch(model, FakeClip(), frames=73, overlap=22, tiles=True, tw=tw, th=th, tov=tov,
+                     tile_carry="sync" if sync else "own_tile")
         pos, lat = conditioning(c, plate, ref, W, H, N)
         calls = []
         orig_sf = comfy.samplers.sampling_function
@@ -668,55 +669,10 @@ def test_tile_sync(model):
             ok &= len(calls) == len(windows) * len(tiles) * steps
             ok &= all(c_[0] in tiles and c_[1] == c_[0] and c_[2] == c_[3] for c_ in calls)
             ok &= out[0].shape == lat["samples"].unbind()[0].shape and bool(torch.isfinite(out[0]).all())
-            check("tile_sync: {} windows sampled over the whole frame, every step split into {} tile calls with the "
+            check("tile_carry sync: {} windows sampled over the whole frame, every step split into {} tile calls with the "
                   "tile's own (cropped) conditioning".format(len(windows), len(tiles)), bool(ok))
-    check("tile_sync gives a different result from tiles one after another",
+    check("tile_carry sync gives a different result from tiles one after another",
           not torch.allclose(outs[True][0], outs[False][0]) and bool(torch.isfinite(outs[True][1]).all()))
-
-
-def test_style_anchor(model):
-    W, H, N = 384, 256, 124
-    plate, ref = torch.rand(N, H, W, 3), torch.rand(1, H, W, 3)
-    log = []
-    m, c = patch(model, FakeClip(log), frames=56, overlap=22, vae=FakeVAE(), style_anchor=True)
-    pos, lat = conditioning(c, plate, ref, W, H, N)
-    texts = []
-    orig_pt = hw.piece_text
-
-    def spy_pt(source, f0, *a, **kw):
-        texts.append((f0, source["text"], [it["type"] for it in source["items"]]))
-        return orig_pt(source, f0, *a, **kw)
-    refs = []
-    orig_is = comfy.samplers.CFGGuider.inner_sample
-
-    def rec(self, noise, latent_image, device, sampler, sigmas, denoise_mask, callback, disable_pbar, seed, latent_shapes=None):
-        refs.append(self.conds["positive"][0].get("minimax_refs"))
-        out = orig_is(self, noise, latent_image, device, sampler, sigmas, denoise_mask, callback, disable_pbar, seed, latent_shapes=latent_shapes)
-        refs[-1] = (refs[-1], comfy.utils.unpack_latents(out.cpu(), latent_shapes)[0])
-        return out
-    hw.piece_text, comfy.samplers.CFGGuider.inner_sample = spy_pt, rec
-    try:
-        sigmas = comfy.samplers.calculate_sigmas(m.get_model_object("model_sampling"), "simple", 2)
-        run(m, pos, lat, sigmas)
-    finally:
-        hw.piece_text, comfy.samplers.CFGGuider.inner_sample = orig_pt, orig_is
-    windows = hw.plan_windows(lat["samples"].unbind()[0].shape[2], 56, 22)
-    first_out = refs[0][1]
-    ok = len(refs) == len(windows) and len(windows) >= 3
-    ok &= sum(1 for b in refs[0][0] if b["kind"] == "image") == 1
-    for r, _ in refs[1:]:
-        imgs = [b for b in r if b["kind"] == "image"]
-        ok &= len(imgs) == 2 and torch.allclose(imgs[1]["latent"], first_out[:, :, :1].float(), atol=1e-5)
-    ok &= len(texts) == len(windows) and all(hw.ANCHOR_TEXT.format(2) in t for f0, t, _ in texts if f0 > 0)
-    ok &= all(hw.ANCHOR_TEXT.format(2) not in t for f0, t, _ in texts if f0 == 0)
-    ok &= all(ty[:3] == ["image", "image", "video"] for f0, _, ty in texts if f0 > 0)
-    ok &= len(log) == 1 + len(windows)
-    check("style_anchor: windows 2-{} get window 1's first frame as <Picture 2> (latent + Qwen image + prompt line), "
-          "each prompt encoded once".format(len(windows)), bool(ok))
-    m2, c2 = patch(model, FakeClip(), frames=56, overlap=22, style_anchor=True)
-    pos2, lat2 = conditioning(c2, plate, ref, W, H, N)
-    out2 = run(m2, pos2, lat2, sigmas)[0]["samples"].unbind()[0]
-    check("style_anchor without vae runs without it", bool(torch.isfinite(out2).all()))
 
 
 if __name__ == "__main__":
@@ -741,7 +697,6 @@ if __name__ == "__main__":
         test_tile_carry(model)
         test_carry_frames(model)
         test_tile_sync(model)
-        test_style_anchor(model)
         test_full_res_plate(model)
         test_long_generation(model)
     print("\n{} failure(s)".format(len(FAILS)))
