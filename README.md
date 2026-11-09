@@ -15,6 +15,8 @@ The pack also has a second node, **Minimax H3 Long Generation**, for long text-t
 
 ## What's new
 
+**1.3.1** — the registry's 1.3.0 was published from an unfinished test build (with separate `style_anchor` / `tile_sync` switches). 1.3.1 is the real 1.3.0: `sync` is an option of `tile_carry`. If you saved a workflow with 1.3.0, re-add the V2V node.
+
 **1.3.0** — tiles no longer ghost on fast motion (1.2.0 workflows load fine, no settings moved)
 - New `tile_carry` option **`sync`** (now the default for new nodes): all tiles take every sampling step together, and their overlaps are averaged after each step. Neighbouring tiles have to agree on where things are, so a fast-moving subject crossing a seam no longer comes out doubled (ghost heads, double eyes), and every tile keeps following the input's motion. Same VRAM (the model still sees one tile at a time) and about the same time. Works with or without temporal windows.
 - Saved workflows keep their old `tile_carry` value (`own_tile` / `blended`), so they render exactly as before. Switch them to `sync` to get the fix.
