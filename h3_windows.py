@@ -87,6 +87,32 @@ def plan_tiles(total, size, overlap):
     return spans
 
 
+def plan_tiles_count(total, count, overlap):
+    """Exactly `count` tiles (fewer only if the frame is too small) covering [0, total), starts on the 2x2 patch
+    grid, neighbours sharing at least `overlap` latents. Tiles are as small as that allows, all the same size."""
+    count = max(1, int(count))
+    if count == 1 or total <= 2:
+        return [(0, total)]
+    count = min(count, total // 2)
+    size = min(total, math.ceil((total + (count - 1) * overlap) / count))
+    size += size % 2
+    while size < total:
+        d = (total - size) // 2                     # free range, in 2-latent steps
+        if d < count - 1:                           # not enough room for distinct starts: fewer tiles
+            count = d + 1
+        gap = 2 * math.ceil(d / (count - 1)) if count > 1 else 0
+        if gap <= size - overlap:
+            break
+        size += 2
+    if size >= total or count == 1:
+        return [(0, total)]
+    d = (total - size) // 2
+    starts = [2 * round(i * d / (count - 1)) for i in range(count)]
+    spans = [(st, st + size) for st in starts]
+    spans[-1] = (spans[-1][0], total)
+    return spans
+
+
 def feather(n, left, right):
     w = torch.ones(n)
     i = torch.arange(n, dtype=torch.float32)
@@ -498,7 +524,8 @@ def image_frames(n_images, keyframe_indices, total_frames):
 class WindowsWrapper:
     def __init__(self, window_frames, overlap_frames, carry_overlap, tile_h, tile_w, tile_overlap, crop_images,
                  min_final_frames=0, tile_audio="generate_once", color_match=False, tile_carry="own_tile",
-                 plate=None, vae=None, plate_scale=1.0, schedule=None, image_policy="own_window", continuous=True):
+                 plate=None, vae=None, plate_scale=1.0, schedule=None, image_policy="own_window", continuous=True,
+                 tile_counts=None):
         self.schedule = schedule          # None = V2V node; a list (maybe empty) = Long Generation node
         self.image_policy = image_policy
         self.continuous = continuous
@@ -511,6 +538,7 @@ class WindowsWrapper:
         self.min_final_frames = min_final_frames
         self.carry_overlap = carry_overlap
         self.tile_h, self.tile_w, self.tile_overlap = tile_h, tile_w, tile_overlap
+        self.tile_counts = tile_counts    # (across, down): tile size follows from the frame size at sampling time
         self.crop_images = crop_images
         self.warned = set()
 
@@ -556,8 +584,20 @@ class WindowsWrapper:
         vshape, ashape = latent_shapes[0], latent_shapes[1]
         latent_t, lat_h, lat_w, audio_t = vshape[2], vshape[3], vshape[4], ashape[-1]
         windows = plan_windows(latent_t, self.window_frames, self.overlap_frames, self.min_final_frames)
-        ys = plan_tiles(lat_h, self.tile_h, self.tile_overlap)
-        xs = plan_tiles(lat_w, self.tile_w, self.tile_overlap)
+        if self.tile_counts is not None:
+            xs = plan_tiles_count(lat_w, self.tile_counts[0], self.tile_overlap)
+            ys = plan_tiles_count(lat_h, self.tile_counts[1], self.tile_overlap)
+            if (len(xs), len(ys)) != tuple(self.tile_counts) and "tile_count" not in self.warned:
+                self.warned.add("tile_count")
+                logging.warning("MiniMax H3 windows: {} x {} tiles asked, {} x {} fit with this tile_overlap on a {} x {} frame.".format(
+                    self.tile_counts[0], self.tile_counts[1], len(xs), len(ys), lat_w * 16, lat_h * 16))
+            if len(ys) > 1 or len(xs) > 1:
+                logging.info("MiniMax H3 windows: {} x {} tiles of about {} x {} px (overlap at least {} px) for a {} x {} frame.".format(
+                    len(xs), len(ys), (xs[0][1] - xs[0][0]) * 16, (ys[0][1] - ys[0][0]) * 16, self.tile_overlap * 16,
+                    lat_w * 16, lat_h * 16))
+        else:
+            ys = plan_tiles(lat_h, self.tile_h, self.tile_overlap)
+            xs = plan_tiles(lat_w, self.tile_w, self.tile_overlap)
         if len(windows) == 1 and len(ys) == 1 and len(xs) == 1:
             return executor(noise, latent_image, sampler, sigmas, denoise_mask, callback, disable_pbar, seed, latent_shapes=latent_shapes)
 

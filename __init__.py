@@ -42,9 +42,12 @@ class MiniMaxH3TemporalWindow(io.ComfyNode):
                                  tooltip="Give each window the previous window's finished overlap frames (video and audio) as its frame-0 guide."),
                 io.Boolean.Input("spatial_tiles", default=False,
                                  tooltip="Split each window into overlapping tiles, for stage 1 or stage 2. Each tile follows its crop of the plate. Without a reference video, a full-denoise pass in tiles repeats the subject."),
-                io.Int.Input("tile_width", default=960, min=256, max=16384, step=32),
-                io.Int.Input("tile_height", default=544, min=256, max=16384, step=32),
-                io.Int.Input("tile_overlap", default=256, min=0, max=8192, step=32),
+                io.Int.Input("tile_width", default=960, min=256, max=16384, step=32,
+                             tooltip="Tile width in pixels (tile_mode = tile_size)."),
+                io.Int.Input("tile_height", default=544, min=256, max=16384, step=32,
+                             tooltip="Tile height in pixels (tile_mode = tile_size)."),
+                io.Int.Input("tile_overlap", default=256, min=0, max=8192, step=32,
+                             tooltip="Pixels shared by neighbouring tiles, used in both tile modes."),
                 io.Boolean.Input("crop_ref_images_per_tile", default=True,
                                  tooltip="With tiles, crop <Picture N> to each tile too. On when the picture is a frame of this shot; off for character/style references."),
                 io.Combo.Input("tile_audio", options=["generate_once", "keep_input"], default="generate_once",
@@ -61,18 +64,27 @@ class MiniMaxH3TemporalWindow(io.ComfyNode):
                                tooltip="Only with the plate input connected. Size of each tile's plate piece relative to the tile. "
                                        "1.0 = full detail (slowest: about 4x the reference tokens of no plate). 0.5 = a quarter of the "
                                        "reference tokens, much faster, still exactly aligned and sharper than without a plate."),
+                io.Combo.Input("tile_mode", options=["tile_size", "tile_count"], default="tile_size",
+                               tooltip="How tiles are set. tile_size: use tile_width / tile_height (pixels). tile_count: split the frame "
+                                       "into tiles_across x tiles_down tiles; their size follows from the frame size. Both use tile_overlap."),
+                io.Int.Input("tiles_across", default=2, min=1, max=16,
+                             tooltip="With tile_mode = tile_count: number of tiles horizontally (1 = no horizontal split)."),
+                io.Int.Input("tiles_down", default=2, min=1, max=16,
+                             tooltip="With tile_mode = tile_count: number of tiles vertically (1 = no vertical split)."),
             ],
             outputs=[io.Model.Output(), io.Clip.Output()],
         )
 
     @classmethod
     def execute(cls, model, temporal_windows, window_frames, overlap_frames, short_final_window, min_final_window_frames, carry_overlap, spatial_tiles, tile_width, tile_height,
-                tile_overlap, crop_ref_images_per_tile, tile_audio="generate_once", color_match=False, tile_carry="own_tile", plate_scale=1.0, clip=None, plate=None, vae=None) -> io.NodeOutput:
+                tile_overlap, crop_ref_images_per_tile, tile_audio="generate_once", color_match=False, tile_carry="own_tile", plate_scale=1.0, tile_mode="tile_size", tiles_across=2, tiles_down=2,
+                clip=None, plate=None, vae=None) -> io.NodeOutput:
         wrapper = WindowsWrapper(window_frames if temporal_windows else 0, overlap_frames, carry_overlap,
                                  tile_height // 16 if spatial_tiles else 0, tile_width // 16 if spatial_tiles else 0,
                                  tile_overlap // 16, crop_ref_images_per_tile,
                                  min_final_window_frames if short_final_window else 0,
-                                 tile_audio, color_match, tile_carry, plate if spatial_tiles else None, vae, plate_scale)
+                                 tile_audio, color_match, tile_carry, plate if spatial_tiles else None, vae, plate_scale,
+                                 tile_counts=(tiles_across, tiles_down) if spatial_tiles and tile_mode == "tile_count" else None)
         return io.NodeOutput(apply(model, wrapper), recording_clip(clip) if clip is not None else None)
 
 

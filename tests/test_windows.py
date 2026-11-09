@@ -104,10 +104,12 @@ def run(model, pos, lat, sigmas, seed=3):
 
 
 def patch(model, clip, frames=124, overlap=22, tiles=False, tw=960, th=544, tov=256, short_final=False, min_final=22,
-          tile_audio="generate_once", color_match=False, tile_carry="own_tile", plate=None, vae=None, plate_scale=1.0):
+          tile_audio="generate_once", color_match=False, tile_carry="own_tile", plate=None, vae=None, plate_scale=1.0,
+          tile_mode="tile_size", across=2, down=2):
     return pack.MiniMaxH3TemporalWindow.execute(model, frames > 0, max(frames, 22), overlap, short_final, min_final, True, tiles, tw, th, tov, True,
                                                 tile_audio=tile_audio, color_match=color_match,
-                                                tile_carry=tile_carry, plate_scale=plate_scale, clip=clip, plate=plate, vae=vae).result
+                                                tile_carry=tile_carry, plate_scale=plate_scale, tile_mode=tile_mode,
+                                                tiles_across=across, tiles_down=down, clip=clip, plate=plate, vae=vae).result
 
 
 def test_plans():
@@ -567,6 +569,33 @@ def test_long_generation(model):
           len(log) > n0 and all(e[0] == "plain prompt" for e in log[n0:]))
 
 
+def test_tile_count():
+    ok = True
+    for total in (24, 34, 48, 68, 84, 96, 120, 168, 240):
+        for n in range(1, 7):
+            for ov in (0, 8, 16):
+                spans = hw.plan_tiles_count(total, n, ov)
+                cover = spans[0][0] == 0 and spans[-1][1] == total and all(b[0] <= a[1] for a, b in zip(spans, spans[1:]))
+                overl = all(a[1] - b[0] >= ov for a, b in zip(spans, spans[1:]))
+                grid = all(s0 % 2 == 0 for s0, _ in spans) and len({b - a for a, b in spans}) == 1
+                distinct = len({a for a, _ in spans}) == len(spans)
+                ok &= cover and overl and grid and distinct and (len(spans) == n or (len(spans) < n and ov * 2 >= total))
+    check("tile_count: N tiles across/down cover the frame with at least the chosen overlap", ok)
+
+
+def test_tile_count_sampling(model):
+    W, H, N = 640, 384, 56
+    plate, ref = torch.rand(N, H, W, 3), torch.rand(1, H, W, 3)
+    m, c = patch(model, FakeClip(), frames=56, overlap=22, tiles=True, tov=96, tile_mode="tile_count", across=3, down=2)
+    pos, lat = conditioning(c, plate, ref, W, H, N, guide=False)
+    v, a = lat["samples"].unbind()
+    sigmas = comfy.samplers.calculate_sigmas(m.get_model_object("model_sampling"), "simple", 3)[1:]
+    out, pieces = sample_pieces(m, pos, lat, sigmas)
+    shapes = sorted({tuple(p["shapes"][0][-2:]) for p in pieces})
+    ok = len(pieces) == 6 and out[0].shape == v.shape and bool(torch.isfinite(out[0]).all())
+    check("tile_count 3 x 2 on a 640x384 frame samples 6 tiles of {} latents".format(shapes), ok)
+
+
 if __name__ == "__main__":
 
 
@@ -574,6 +603,7 @@ if __name__ == "__main__":
     test_short_final_window_plan()
     test_guide_helpers()
     test_exact_crop()
+    test_tile_count()
     test_schedule_parsing()
     with tempfile.TemporaryDirectory() as d:
         model = tiny_model(os.path.join(d, "tiny_h3.safetensors"))
@@ -584,6 +614,7 @@ if __name__ == "__main__":
         test_ksampler(model)
         test_stage2_tiles(model)
         test_tile_audio(model)
+        test_tile_count_sampling(model)
         test_tile_carry(model)
         test_full_res_plate(model)
         test_long_generation(model)
