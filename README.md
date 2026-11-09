@@ -15,6 +15,11 @@ The pack also has a second node, **Minimax H3 Long Generation**, for long text-t
 
 ## What's new
 
+**1.2.0** — ⚠️ the V2V node's settings were reordered, so **old workflows load with shifted values**
+- New `carry_frames` (right under `carry_overlap`): how many of the overlap frames the next window gets as its guide. Fewer = less extra memory from window 2 on, while the whole overlap is still crossfaded. At or above `overlap_frames` (the default with overlap 22) it carries the whole overlap, exactly as before.
+- Settings regrouped: `overlap_frames` sits under `temporal_windows`, `carry_frames` under `carry_overlap`, and `tile_mode` right under `spatial_tiles`, followed by its tile settings.
+- **If an old workflow looks wrong after updating:** delete the V2V node and add it again, then re-enter your settings. To see what your old settings were, switch the pack back to **1.1.4** in ComfyUI Manager (Custom Nodes Manager → this pack → *Switch Ver* → 1.1.4), restart, open the workflow and note the values, then update to 1.2.0 again and enter them in the new node. The Long Generation node is unchanged.
+
 **1.1.4**
 - The V2V node now only shows the tile settings of the chosen `tile_mode`: `tile_width` / `tile_height` for `tile_size`, `tiles_across` / `tiles_down` for `tile_count`. The others are hidden, not removed, so saved workflows keep all their values.
 
@@ -114,6 +119,7 @@ Everything else is the stock H3 workflow: Reference to Video (with your video as
 | `short_final_window` | Off (default): the last window is pulled back to a full `window_frames`, re-generating some frames at the end. On: the last window keeps its natural shorter length, saving time. |
 | `min_final_window_frames` | With `short_final_window` on: the shortest the last window may be (5, 22, 39, 56…). |
 | `carry_overlap` | On (recommended): each window starts from the previous window's finished overlap frames (video and audio), so motion continues without a jump. |
+| `carry_frames` | With `carry_overlap`: how many of those overlap frames (5, 22, 39…) guide the next window, taken right before its new frames. At or above `overlap_frames` = the whole overlap. Lower it (e.g. overlap 39, carry 22) if window 2 runs out of memory: the carried frames are extra tokens in every window after the first. |
 
 ### Spatial tiles
 
@@ -155,6 +161,7 @@ Everything else is the stock H3 workflow: Reference to Video (with your video as
 - **Stage 2: check your real sigmas.** `BasicScheduler` with `denoise` does not start at that amount of noise: with `linear_quadratic`, denoise 0.4 actually starts at sigma 0.93, almost a full re-generation, and windows and tiles will then disagree. For a refine, start around 0.2–0.45 (e.g. with ManualSigmas).
 - **Seam where windows join:** increase `overlap_frames` (22 → 39).
 - **Seam between tiles:** increase `tile_overlap`, then try `color_match`.
+- **Out of memory at window 2 (often on big cloud GPUs, e.g. "exceeds allowed memory" right after window 1).** From window 2 on, each window also holds the carried frames, so it is a bit bigger than window 1, and ComfyUI's built-in model compiler (the console shows `Comfy model compiler graph breaks`, part of dynamic VRAM) re-records for the new size. This is ComfyUI itself, not a torch compile node in the workflow. Fixes, in order: start ComfyUI with `--disable-comfy-compiler`; if it still fails, add `--disable-dynamic-vram`; then lower `carry_frames` (or `overlap_frames`) or `window_frames`.
 - **Fine texture flickering ("micro-boiling") at high resolution** comes mostly from the model and sampler (few-step LoRAs especially), not from tiling. Generating at about 1 MP and refining in stage 2 at low denoise is the most stable route to high resolution.
 
 ## Long Generation node (text / image to video)

@@ -105,11 +105,14 @@ def run(model, pos, lat, sigmas, seed=3):
 
 def patch(model, clip, frames=124, overlap=22, tiles=False, tw=960, th=544, tov=256, short_final=False, min_final=22,
           tile_audio="generate_once", color_match=False, tile_carry="own_tile", plate=None, vae=None, plate_scale=1.0,
-          tile_mode="tile_size", across=2, down=2):
-    return pack.MiniMaxH3TemporalWindow.execute(model, frames > 0, max(frames, 22), overlap, short_final, min_final, True, tiles, tw, th, tov, True,
-                                                tile_audio=tile_audio, color_match=color_match,
-                                                tile_carry=tile_carry, plate_scale=plate_scale, tile_mode=tile_mode,
-                                                tiles_across=across, tiles_down=down, clip=clip, plate=plate, vae=vae).result
+          tile_mode="tile_size", across=2, down=2, carry_frames=None):
+    return pack.MiniMaxH3TemporalWindow.execute(
+        model=model, temporal_windows=frames > 0, window_frames=max(frames, 22), overlap_frames=overlap,
+        short_final_window=short_final, min_final_window_frames=min_final, carry_overlap=True,
+        carry_frames=overlap if carry_frames is None else carry_frames,
+        spatial_tiles=tiles, tile_mode=tile_mode, tile_width=tw, tile_height=th, tiles_across=across, tiles_down=down,
+        tile_overlap=tov, tile_carry=tile_carry, tile_audio=tile_audio, crop_ref_images_per_tile=True,
+        color_match=color_match, plate_scale=plate_scale, clip=clip, plate=plate, vae=vae).result
 
 
 def test_plans():
@@ -596,6 +599,36 @@ def test_tile_count_sampling(model):
     check("tile_count 3 x 2 on a 640x384 frame samples 6 tiles of {} latents".format(shapes), ok)
 
 
+def test_carry_frames(model):
+    W, H, N = 384, 256, 175
+    plate, ref = torch.rand(N, H, W, 3), torch.rand(1, H, W, 3)
+    m, c = patch(model, FakeClip(), frames=73, overlap=39, carry_frames=22)
+    pos, lat = conditioning(c, plate, ref, W, H, N, guide=False)
+    carries = []
+    orig_pc = hw.piece_conds
+
+    def spy(conds, k0, k1, ys_, xs_, *a, **kw):
+        if a[3] is not None:
+            carries.append((k0, a[3]))
+        return orig_pc(conds, k0, k1, ys_, xs_, *a, **kw)
+    hw.piece_conds = spy
+    try:
+        sigmas = comfy.samplers.calculate_sigmas(m.get_model_object("model_sampling"), "simple", 2)
+        out, pieces = sample_pieces(m, pos, lat, sigmas)
+    finally:
+        hw.piece_conds = orig_pc
+    windows = hw.plan_windows(lat["samples"].unbind()[0].shape[2], 73, 39)
+    ov_t, c_t = hw.tokens_for_frames(39), hw.tokens_for_frames(22)
+    ok = len(windows) >= 2 and len(carries) == len(windows) - 1 and bool(torch.isfinite(out[0]).all())
+    for j, (k0, carry) in enumerate(carries):
+        p0 = windows[j][0]
+        raw = pieces[j]["out"][0][:, :, k0 - p0 + ov_t - c_t:k0 - p0 + ov_t].float()
+        ok &= carry["resolved_frame_index"] == hw.frames_for_tokens(ov_t - c_t) and carry["latent"].shape[2] == c_t
+        ok &= torch.allclose(carry["latent"], raw, atol=1e-5) and carry.get("audio_latent") is not None
+    check("carry_frames 22 of a 39-frame overlap: each window gets the last 22 overlap frames (at frame {}) as its guide".format(
+        hw.frames_for_tokens(ov_t - c_t)), bool(ok))
+
+
 if __name__ == "__main__":
 
 
@@ -616,6 +649,7 @@ if __name__ == "__main__":
         test_tile_audio(model)
         test_tile_count_sampling(model)
         test_tile_carry(model)
+        test_carry_frames(model)
         test_full_res_plate(model)
         test_long_generation(model)
     print("\n{} failure(s)".format(len(FAILS)))

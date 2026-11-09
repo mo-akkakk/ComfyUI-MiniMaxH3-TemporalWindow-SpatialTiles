@@ -525,7 +525,7 @@ class WindowsWrapper:
     def __init__(self, window_frames, overlap_frames, carry_overlap, tile_h, tile_w, tile_overlap, crop_images,
                  min_final_frames=0, tile_audio="generate_once", color_match=False, tile_carry="own_tile",
                  plate=None, vae=None, plate_scale=1.0, schedule=None, image_policy="own_window", continuous=True,
-                 tile_counts=None):
+                 tile_counts=None, carry_frames=0):
         self.schedule = schedule          # None = V2V node; a list (maybe empty) = Long Generation node
         self.image_policy = image_policy
         self.continuous = continuous
@@ -539,6 +539,7 @@ class WindowsWrapper:
         self.carry_overlap = carry_overlap
         self.tile_h, self.tile_w, self.tile_overlap = tile_h, tile_w, tile_overlap
         self.tile_counts = tile_counts    # (across, down): tile size follows from the frame size at sampling time
+        self.carry_frames = carry_frames  # 0 = the whole overlap; else only the last carry_frames of it guide the window
         self.crop_images = crop_images
         self.warned = set()
 
@@ -666,9 +667,14 @@ class WindowsWrapper:
             for wi, (t0, tn) in enumerate(windows):
                 a0 = 0 if t0 == 0 else min(audio_ticks(frames_for_tokens(t0)), audio_t)
                 a1 = audio_t if wi == len(windows) - 1 else min(audio_t, a0 + audio_ticks(frames_for_tokens(tn)))
-                carry_t = 0
+                carry_t = carry_s = 0
                 if self.carry_overlap and done_t > t0:
                     carry_t = tokens_for_frames(frames_for_tokens(done_t - t0))
+                    if self.carry_frames:
+                        # only the last carry_frames of the overlap, right before the window's new frames: fewer
+                        # extra tokens (less memory); the whole overlap is still crossfaded
+                        short = min(carry_t, tokens_for_frames(self.carry_frames))
+                        carry_s, carry_t = carry_t - short, short
                 win_v = torch.zeros(vshape[:2] + (tn,) + tuple(vshape[3:]), dtype=torch.float32)
                 win_a = None
                 weight = torch.zeros((1, 1, 1, lat_h, lat_w))
@@ -683,13 +689,20 @@ class WindowsWrapper:
                         if own_carry and (yi, xi) in prev_tiles:
                             # continue this tile's own chain: its unblended frames from the previous window
                             p0, prv = prev_tiles[(yi, xi)]
-                            c_lat = prv[:, :, t0 - p0:t0 - p0 + carry_t].clone()
+                            c_lat = prv[:, :, t0 - p0 + carry_s:t0 - p0 + carry_s + carry_t].clone()
                         else:
-                            c_lat = out_v[:, :, t0:t0 + carry_t, y0:y1, x0:x1].clone()
-                        carry = {"resolved_frame_index": 0, "latent": c_lat}
-                        a_n = min(done_a - a0, audio_ticks(frames_for_tokens(carry_t)))
-                        if a_n > 0:
-                            carry["audio_latent"] = out_a[..., a0:a0 + a_n].clone()
+                            c_lat = out_v[:, :, t0 + carry_s:t0 + carry_s + carry_t, y0:y1, x0:x1].clone()
+                        fs = frames_for_tokens(carry_s)
+                        carry = {"resolved_frame_index": fs, "latent": c_lat}
+                        if carry_s == 0:
+                            c_a0 = a0
+                            c_a1 = a0 + min(done_a - a0, audio_ticks(frames_for_tokens(carry_t)))
+                        else:
+                            f_abs = frames_for_tokens(t0)
+                            c_a0 = audio_ticks(f_abs + fs)
+                            c_a1 = min(done_a, audio_ticks(f_abs + fs + frames_for_tokens(carry_t)))
+                        if c_a1 > c_a0:
+                            carry["audio_latent"] = out_a[..., c_a0:c_a1].clone()
                     guider.conds = piece_conds(base_conds, t0, t0 + tn, ys[yi] if split_space else None,
                                                xs[xi] if split_space else None, lat_h, lat_w, self.crop_images,
                                                carry, self.warned, text_cache, self.plate, gen)
