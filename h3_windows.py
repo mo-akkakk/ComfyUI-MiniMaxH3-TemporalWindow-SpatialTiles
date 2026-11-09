@@ -30,6 +30,8 @@ import torch
 
 import comfy.model_management
 import comfy.patcher_extension
+import comfy.sampler_helpers
+import comfy.samplers
 import comfy.utils
 from comfy.ldm.minimax.model import FRAME_PER_TOKEN, FRAME_RESCALE
 
@@ -38,6 +40,8 @@ TEXT_SOURCE = "minimax_h3_text_source"
 CLIP_TOKENS = 5
 FPS = 24
 COLOR_CLAMP = 0.05
+ANCHOR = "minimax_h3_anchor"
+ANCHOR_TEXT = "Every frame keeps the look of <Picture {}>: the same lighting, weather, colours and styling."
 
 
 def frames_for_tokens(t):
@@ -252,7 +256,7 @@ def window_refs(refs, k0, k1):
 def tile_refs(refs, ys, xs, lat_h, lat_w, crop_images):
     out = []
     for blk in refs:
-        if blk["kind"] not in ("video", "video_audio") and not (crop_images and blk["kind"] == "image"):
+        if blk["kind"] not in ("video", "video_audio") and not ((crop_images or blk.get(ANCHOR)) and blk["kind"] == "image"):
             out.append(blk)
             continue
         new = dict(blk)
@@ -356,6 +360,7 @@ def piece_text(source, f0, frames, ys, xs, lat_h, lat_w, crop_images, cache, gen
     items = []
     for it in source["items"]:
         it = dict(it)
+        anchor = it.pop(ANCHOR, False)  # style_anchor's frame of the shot: cropped to the tile like the shot
         if it["type"] == "video":
             ts = it.get("timestamps") or [i / 2.0 for i in range(it["data"].shape[0])]
             keep = [i for i, t in enumerate(ts) if t0 <= t < t1] or [min(range(len(ts)), key=lambda i: abs(ts[i] - t0))]
@@ -363,7 +368,7 @@ def piece_text(source, f0, frames, ys, xs, lat_h, lat_w, crop_images, cache, gen
             it["timestamps"] = [ts[i] - ts[keep[0]] for i in keep]
             if ys is not None:
                 it["data"] = crop_pixels(it["data"], ys, xs, lat_h, lat_w)
-        elif it["type"] == "image" and ys is not None and crop_images:
+        elif it["type"] == "image" and ys is not None and (crop_images or anchor):
             it["data"] = crop_pixels(it["data"], ys, xs, lat_h, lat_w)
         items.append(it)
     cond = clip.encode_from_tokens_scheduled(clip.tokenize(text, minimax_ref_items=items))
@@ -525,12 +530,13 @@ class WindowsWrapper:
     def __init__(self, window_frames, overlap_frames, carry_overlap, tile_h, tile_w, tile_overlap, crop_images,
                  min_final_frames=0, tile_audio="generate_once", color_match=False, tile_carry="own_tile",
                  plate=None, vae=None, plate_scale=1.0, schedule=None, image_policy="own_window", continuous=True,
-                 tile_counts=None, carry_frames=0):
+                 tile_counts=None, carry_frames=0, tile_sync=False, style_anchor=False):
         self.schedule = schedule          # None = V2V node; a list (maybe empty) = Long Generation node
         self.image_policy = image_policy
         self.continuous = continuous
         self.window_frames = window_frames
         self.plate = (plate, vae, plate_scale) if plate is not None and vae is not None else None
+        self.vae = vae
         self.tile_carry = tile_carry
         self.tile_audio = tile_audio
         self.color_match = color_match
@@ -541,6 +547,8 @@ class WindowsWrapper:
         self.tile_counts = tile_counts    # (across, down): tile size follows from the frame size at sampling time
         self.carry_frames = carry_frames  # 0 = the whole overlap; else only the last carry_frames of it guide the window
         self.crop_images = crop_images
+        self.tile_sync = tile_sync        # tiles take every sampling step together, overlaps averaged each step
+        self.style_anchor = style_anchor  # windows after the first also see window 1's first frame as a <Picture>
         self.warned = set()
 
     def generation_state(self, windows, conds, latent_t):
@@ -578,6 +586,90 @@ class WindowsWrapper:
                     img_at[id(src)] = image_frames(len(src["images"]), kfi, total)
         return {"compose": compose, "image_frames": img_at, "policy": self.image_policy}
 
+    def add_style_anchor(self, conds, z):
+        """style_anchor: add the finished first frame (latent z, one token) as one more <Picture> reference to the
+        prompts that carry reference items, with a line asking every frame to keep its look. Motion still comes
+        from <Video 1>; the picture only holds lighting, weather, colours and styling. Returns True if added."""
+        px = self.vae.decode(z)
+        px = px.reshape((-1,) + tuple(px.shape[-3:]))[:1].float().cpu()
+        added = False
+        for lst in conds.values():
+            for c in lst:
+                src = c.get(TEXT_SOURCE)
+                if src is None or not src.get("items") or src.get("images") is not None:
+                    continue
+                n_img = sum(1 for it in src["items"] if it["type"] == "image")
+                items = list(src["items"])
+                items.insert(n_img, {"type": "image", "data": px, ANCHOR: True})
+                c[TEXT_SOURCE] = dict(src, items=items, text=src["text"].rstrip() + " " + ANCHOR_TEXT.format(n_img + 1))
+                refs = list(c.get("minimax_refs") or [])
+                n_blk = sum(1 for b in refs if b["kind"] == "image")
+                refs.insert(n_blk, {"kind": "image", "latent_h": z.shape[-2], "latent_w": z.shape[-1], "latent": z, ANCHOR: True})
+                c["minimax_refs"] = refs
+                added = True
+        return added
+
+    def sample_window_sync(self, executor, guider, tile_conds, tile_shapes, boxes, weights, p_noise, p_lat, p_mask,
+                           shapes, sampler, sigmas, disable_pbar, seed):
+        """Sample one window over the whole frame, with every model call split into the tiles: each tile is
+        predicted with its own conditioning, and the tiles' predictions are feather-blended after every step,
+        so neighbouring tiles agree on what is where (no ghosting where a moving subject crosses a seam).
+        Each model call still sees one tile, so VRAM use is the same as tiling one after another."""
+        state = {}
+
+        def predict(x, timestep, model_options={}, seed=None):
+            model = guider.inner_model
+            full = model.latent_shapes
+            try:
+                if "conds" not in state:
+                    state["conds"] = []
+                    for tc, ts, (y0, y1, x0, x1) in zip(tile_conds, tile_shapes, boxes):
+                        model.latent_shapes = ts
+                        z = comfy.utils.pack_latents([torch.zeros(ts[0], device=x.device), torch.zeros(ts[1], device=x.device)])[0]
+                        m = None
+                        if p_mask is not None:
+                            mv, ma = comfy.utils.unpack_latents(p_mask.to(x.device), shapes)[:2]
+                            m = comfy.utils.pack_latents([mv.expand(shapes[0])[..., y0:y1, x0:x1], ma.expand(shapes[1])])[0]
+                        state["conds"].append(comfy.samplers.process_conds(
+                            model, z, {k: v[:] for k, v in tc.items()}, x.device, None, m, seed, latent_shapes=ts))
+                    state["w"] = [w.to(x.device, x.dtype) for w in weights]
+                    wsum = torch.zeros(shapes[0][-2:], device=x.device, dtype=x.dtype)
+                    for w, (y0, y1, x0, x1) in zip(state["w"], boxes):
+                        wsum[y0:y1, x0:x1] += w
+                    state["wsum"] = wsum
+                xv, xa = comfy.utils.unpack_latents(x, full)[:2]
+                acc = torch.zeros_like(xv)
+                out_a = None
+                for c, ts, w, (y0, y1, x0, x1) in zip(state["conds"], tile_shapes, state["w"], boxes):
+                    model.latent_shapes = ts
+                    xt = comfy.utils.pack_latents([xv[..., y0:y1, x0:x1].contiguous(), xa])[0]
+                    o = comfy.samplers.sampling_function(model, xt, timestep, c.get("negative", None), c.get("positive", None),
+                                                         guider.cfg, model_options=model_options, seed=seed)
+                    ov, oa = comfy.utils.unpack_latents(o, ts)[:2]
+                    acc[..., y0:y1, x0:x1] += ov * w
+                    if out_a is None:
+                        out_a = oa  # one soundtrack: the first tile's
+                return comfy.utils.pack_latents([acc / state["wsum"], out_a.reshape(xa.shape)])[0]
+            finally:
+                model.latent_shapes = full
+
+        # load the model for one tile's size, not the whole frame (each model call only sees one tile)
+        tile_n = max(math.prod(ts[0][1:]) + math.prod(ts[1][1:]) for ts in tile_shapes)
+        orig_prepare = comfy.sampler_helpers.prepare_sampling
+
+        def prepare(model, noise_shape, *a, **kw):
+            return orig_prepare(model, list(noise_shape[:-1]) + [tile_n], *a, **kw)
+        guider.conds = tile_conds[0]
+        guider.predict_noise = predict
+        comfy.sampler_helpers.prepare_sampling = prepare
+        try:
+            res = executor(p_noise, p_lat, sampler, sigmas, p_mask, None, disable_pbar, seed, latent_shapes=shapes)
+        finally:
+            comfy.sampler_helpers.prepare_sampling = orig_prepare
+            del guider.predict_noise
+        rv, ra = comfy.utils.unpack_latents(res, shapes)[:2]
+        return rv.float().cpu(), ra.float().cpu()
+
     def __call__(self, executor, noise, latent_image, sampler, sigmas, denoise_mask=None, callback=None,
                  disable_pbar=False, seed=None, latent_shapes=None):
         if latent_shapes is None or len(latent_shapes) < 2 or len(latent_shapes[0]) != 5:
@@ -614,6 +706,14 @@ class WindowsWrapper:
         out_a = torch.zeros(ashape, dtype=torch.float32)
 
         gen = self.generation_state(windows, base_conds, latent_t) if self.schedule is not None else None
+        anchor = self.style_anchor and len(windows) > 1 and self.schedule is None
+        if anchor and self.vae is None:
+            anchor = False
+            logging.warning("MiniMax H3 windows: style_anchor needs the vae input connected; running without it.")
+        if anchor and not any((c.get(TEXT_SOURCE) or {}).get("items") for lst in base_conds.values() for c in lst):
+            anchor = False
+            logging.warning("MiniMax H3 windows: style_anchor needs the CLIP routed through this node into "
+                            "Reference to Video; running without it.")
 
         # Encode everything up front, before the DiT is loaded, one model at a time: first every plate piece
         # (video VAE), then every prompt (text encoder). Interleaving them made the two big models swap for
@@ -632,6 +732,9 @@ class WindowsWrapper:
         for label, with_text in stages:
             for i, (t0, tn, yi, xi) in enumerate(pieces):
                 comfy.model_management.throw_exception_if_processing_interrupted()
+                if with_text and anchor and t0 > 0:
+                    done_jobs += 1  # encoded after window 1, with the anchor picture
+                    continue
                 if len(pieces) > 1:
                     logging.info("MiniMax H3 windows: encoding {} {}/{} (window {}/{}, tile {}/{})".format(
                         label, i + 1, len(pieces), windows.index((t0, tn)) + 1, len(windows),
@@ -678,8 +781,10 @@ class WindowsWrapper:
                 win_v = torch.zeros(vshape[:2] + (tn,) + tuple(vshape[3:]), dtype=torch.float32)
                 win_a = None
                 weight = torch.zeros((1, 1, 1, lat_h, lat_w))
-                own_carry = split_space and self.tile_carry == "own_tile"
+                sync = split_space and self.tile_sync
+                own_carry = split_space and self.tile_carry == "own_tile" and not sync
                 cur_tiles = {}
+                sync_conds, sync_shapes = [], []
                 for ti, (yi, xi) in enumerate(tiles):
                     comfy.model_management.throw_exception_if_processing_interrupted()
                     (y0, y1), (x0, x1) = ys[yi], xs[xi]
@@ -707,6 +812,10 @@ class WindowsWrapper:
                                                xs[xi] if split_space else None, lat_h, lat_w, self.crop_images,
                                                carry, self.warned, text_cache, self.plate, gen)
                     shapes = [torch.Size(vshape[:2] + (tn, y1 - y0, x1 - x0)), torch.Size(tuple(ashape[:-1]) + (a1 - a0,))]
+                    if sync:
+                        sync_conds.append(guider.conds)
+                        sync_shapes.append(shapes)
+                        continue
                     p_noise = comfy.utils.pack_latents([noise_v[vs], noise_a[..., a0:a1]])[0]
                     p_lat = comfy.utils.pack_latents([lat_v[vs], lat_a[..., a0:a1]])[0]
                     p_mask = None
@@ -732,7 +841,20 @@ class WindowsWrapper:
                     if win_a is None:
                         # one soundtrack: the first tile's (averaging differently generated soundtracks blurs them)
                         win_a = ra.float().cpu()
-                win_v /= weight
+                if sync:
+                    vs = (slice(None), slice(None), slice(t0, t0 + tn))
+                    shapes = [torch.Size(vshape[:2] + (tn, lat_h, lat_w)), torch.Size(tuple(ashape[:-1]) + (a1 - a0,))]
+                    p_mask = None
+                    if masks is not None:
+                        p_mask = comfy.utils.pack_latents([masks[0].expand(vshape)[vs], masks[1].expand(ashape)[..., a0:a1]])[0]
+                    boxes = [(ys[yi][0], ys[yi][1], xs[xi][0], xs[xi][1]) for yi, xi in tiles]
+                    win_v, win_a = self.sample_window_sync(
+                        executor, guider, sync_conds, sync_shapes, boxes, [tile_weight(ys, xs, yi, xi) for yi, xi in tiles],
+                        comfy.utils.pack_latents([noise_v[vs], noise_a[..., a0:a1]])[0],
+                        comfy.utils.pack_latents([lat_v[vs], lat_a[..., a0:a1]])[0], p_mask, shapes, sampler, sigmas,
+                        disable_pbar, seed)
+                else:
+                    win_v /= weight
                 prev_tiles = cur_tiles
                 if split_space and self.tile_audio == "keep_input":
                     win_a = lat_a[..., a0:a1].float().cpu()
@@ -752,6 +874,15 @@ class WindowsWrapper:
                     out_a[..., a0:a0 + ov_a] = out_a[..., a0:a0 + ov_a] * (1 - fade) + win_a[..., :ov_a] * fade
                 out_a[..., a0 + ov_a:a1] = win_a[..., ov_a:]
                 done_t, done_a = max(done_t, t0 + tn), max(done_a, a1)
+                if anchor and wi == 0:
+                    if self.add_style_anchor(base_conds, out_v[:, :, :1].clone()):
+                        later = [p for p in pieces if p[0] > 0]
+                        for i, (p0, pn, yi, xi) in enumerate(later):
+                            comfy.model_management.throw_exception_if_processing_interrupted()
+                            logging.info("MiniMax H3 windows: style_anchor: encoding prompt {}/{}".format(i + 1, len(later)))
+                            piece_conds(base_conds, p0, p0 + pn, ys[yi] if split_space else None,
+                                        xs[xi] if split_space else None, lat_h, lat_w, self.crop_images, None,
+                                        self.warned, text_cache, self.plate, gen)
                 logging.info("MiniMax H3 windows: window {}/{} done (frames {}-{}, {} frames carried in).".format(
                     wi + 1, len(windows), frames_for_tokens(t0), frames_for_tokens(t0 + tn) - 1,
                     frames_for_tokens(carry_t) if carry_t else 0))

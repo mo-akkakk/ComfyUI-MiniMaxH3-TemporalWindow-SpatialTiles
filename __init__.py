@@ -45,6 +45,11 @@ class MiniMaxH3TemporalWindow(io.ComfyNode):
                                      "taken right before its new frames. Equal to or above overlap_frames = the whole overlap (as before 1.2.0). "
                                      "Fewer = less extra memory from window 2 on, while the whole overlap is still crossfaded. "
                                      "Capped at overlap_frames."),
+                io.Boolean.Input("style_anchor", default=False,
+                                 tooltip="Against the look fading over a long shot: every window after the first also gets the first "
+                                         "finished frame as one more <Picture> reference, with a line asking every frame to keep its "
+                                         "lighting, weather, colours and styling. Motion still follows <Video 1>. Needs vae and the CLIP "
+                                         "routed through this node into Reference to Video. The later prompts are encoded after window 1."),
                 io.Boolean.Input("spatial_tiles", default=False,
                                  tooltip="Split each window into overlapping tiles, for stage 1 or stage 2. Each tile follows its crop of the plate. Without a reference video, a full-denoise pass in tiles repeats the subject."),
                 io.Combo.Input("tile_mode", options=["tile_size", "tile_count"], default="tile_size",
@@ -60,6 +65,11 @@ class MiniMaxH3TemporalWindow(io.ComfyNode):
                              tooltip="With tile_mode = tile_count: number of tiles vertically (1 = no vertical split)."),
                 io.Int.Input("tile_overlap", default=256, min=0, max=8192, step=32,
                              tooltip="Pixels shared by neighbouring tiles, used in both tile modes."),
+                io.Boolean.Input("tile_sync", default=False,
+                                 tooltip="Tiles take every sampling step together and their overlaps are averaged after each step, "
+                                         "so neighbouring tiles agree on where things are: no ghosting where a moving subject crosses "
+                                         "a seam. Same VRAM (the model still sees one tile at a time) and about the same time. "
+                                         "Off = each tile is sampled on its own and blended at the end (1.2.0 and earlier)."),
                 io.Combo.Input("tile_carry", options=["own_tile", "blended"], default="own_tile",
                                tooltip="With tiles and carry_overlap: own_tile = each tile continues from its own unblended frames of the "
                                        "previous window, so blending errors are not fed forward (less drift over long shots). "
@@ -82,8 +92,8 @@ class MiniMaxH3TemporalWindow(io.ComfyNode):
 
     @classmethod
     def execute(cls, model, temporal_windows, window_frames, overlap_frames, short_final_window, min_final_window_frames,
-                carry_overlap, carry_frames, spatial_tiles, tile_mode, tile_width, tile_height, tiles_across, tiles_down,
-                tile_overlap, tile_carry, tile_audio, crop_ref_images_per_tile, color_match, plate_scale,
+                carry_overlap, carry_frames, style_anchor, spatial_tiles, tile_mode, tile_width, tile_height, tiles_across,
+                tiles_down, tile_overlap, tile_sync, tile_carry, tile_audio, crop_ref_images_per_tile, color_match, plate_scale,
                 clip=None, plate=None, vae=None) -> io.NodeOutput:
         wrapper = WindowsWrapper(window_frames if temporal_windows else 0, overlap_frames, carry_overlap,
                                  tile_height // 16 if spatial_tiles else 0, tile_width // 16 if spatial_tiles else 0,
@@ -91,7 +101,8 @@ class MiniMaxH3TemporalWindow(io.ComfyNode):
                                  min_final_window_frames if short_final_window else 0,
                                  tile_audio, color_match, tile_carry, plate if spatial_tiles else None, vae, plate_scale,
                                  tile_counts=(tiles_across, tiles_down) if spatial_tiles and tile_mode == "tile_count" else None,
-                                 carry_frames=carry_frames if carry_frames < overlap_frames else 0)
+                                 carry_frames=carry_frames if carry_frames < overlap_frames else 0,
+                                 tile_sync=tile_sync, style_anchor=style_anchor)
         return io.NodeOutput(apply(model, wrapper), recording_clip(clip) if clip is not None else None)
 
 
