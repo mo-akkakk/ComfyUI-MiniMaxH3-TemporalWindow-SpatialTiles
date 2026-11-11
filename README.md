@@ -15,6 +15,10 @@ The pack also has a second node, **Minimax H3 Long Generation**, for long text-t
 
 ## What's new
 
+**1.4.0** — new node: **Minimax H3 Multi Guide**
+- All your guide frames in one node instead of a chain of Add Guide nodes: connect an image (or a clip) to `guide_0` and the next guide slot appears, each with its own `frame_idx`; audio guides work the same way (`audio_0`, `audio_frame_idx_0`...). See [Multi Guide node](#multi-guide-node).
+- New tip on writing prompts for tiles (sentences that are true in any crop of the frame).
+
 **1.3.1** — the registry's 1.3.0 was published from an unfinished test build (with separate `style_anchor` / `tile_sync` switches). 1.3.1 is the real 1.3.0: `sync` is an option of `tile_carry`. If you saved a workflow with 1.3.0, re-add the V2V node.
 
 **1.3.0** — tiles no longer ghost on fast motion (1.2.0 workflows load fine, no settings moved)
@@ -172,6 +176,8 @@ Everything else is the stock H3 workflow: Reference to Video (with your video as
 
 ## Tips
 
+- **Prompts for tiles: write sentences that are true in any crop of the frame.** Every tile reads the same prompt, so a tile that only shows an empty passenger seat, told to "match the head movement of the man", adds a man. Say "every person in `<Video 1>`" instead of "the man", add explicit lines like "only the people visible in `<Video 1>` appear, nobody is added, empty seats stay empty" (at cfg 1 there is no negative prompt, so the "no" goes in the positive), and use H3's own reference names `<Video 1>` / `<Picture 1>` (counted from 1), not `<ref_video_0>`. Example (car on a green screen):
+  > `<Video 1>` is the source footage. Keep its camera motion exactly, and keep every person in it exactly as they are: the same head movement and micro expressions, matched to the pixel. `<Picture 1>` is the final look of the shot. Outside the car windows the green screen is replaced by a cliff road matching `<Picture 1>`; the car is already moving along it, with no car shake. Inside the car everything stays as in `<Video 1>`: only the people visible in `<Video 1>` appear, nobody is added, and empty seats stay empty. Nobody talks, mouths stay still. Sound: ambient road noise, no speech.
 - **Write the prompt so it is true for every frame**, because each window reads it on its own.
 - **This node is for video-to-video.** Windows follow the reference video, which tells each window where it is in the shot. With only text or a picture (no `ref_video_0`), every window gets the same prompt, so each window tends to act out the whole prompt again — a long story "restarts" every window. For text- or image-driven generation, use the **Long Generation** node instead.
 - **Use H3's reference tags in the prompt:** `<Video 1>`, `<Picture 1>`, `<Audio 1>` (counting from 1 for each kind). These are the labels Qwen actually sees; input names like `ref_video_0` are not.
@@ -181,6 +187,19 @@ Everything else is the stock H3 workflow: Reference to Video (with your video as
 - **Seam between tiles:** increase `tile_overlap`, then try `color_match`.
 - **Out of memory at window 2 (often on big cloud GPUs, e.g. "exceeds allowed memory" right after window 1).** From window 2 on, each window also holds the carried frames, so it is a bit bigger than window 1, and ComfyUI's built-in model compiler (the console shows `Comfy model compiler graph breaks`, part of dynamic VRAM) re-records for the new size. This is ComfyUI itself, not a torch compile node in the workflow. Fixes, in order: start ComfyUI with `--disable-comfy-compiler`; if it still fails, add `--disable-dynamic-vram`; then lower `carry_frames` (or `overlap_frames`) or `window_frames`.
 - **Fine texture flickering ("micro-boiling") at high resolution** comes mostly from the model and sampler (few-step LoRAs especially), not from tiling. Generating at about 1 MP and refining in stage 2 at low denoise is the most stable route to high resolution.
+
+## Multi Guide node
+
+**Minimax H3 Multi Guide (mo-akkakk)** does what ComfyUI's **Add Guide for MiniMax H3** does, for many guides in one node.
+
+- Wire `positive`, `latent`, `vae` and `audio_vae` like Add Guide (positive and latent from Reference to Video or Image to Video), and its `positive` output on to the sampler (or the next node). `vae` is needed for image guides, `audio_vae` for audio guides.
+- Connect an image to `guide_0`: a `guide_1` slot appears, and so on (up to 16). Each connected guide shows its own `frame_idx`.
+- `frame_idx` = the frame to anchor that guide at. Negative counts from the end: `-1` = the last frame.
+- A guide can also be a clip (an image batch): it is anchored as a clip of 5, 22, 39... (17k+5) frames starting at `frame_idx`, cropped down to that length, exactly like Add Guide. That is how a whole source video can be one guide, with edited single frames as further guides.
+- Each guide is anchored exactly as the native Add Guide would anchor it, in slot order, so the result is the same as chaining one Add Guide per image. An error names the guide slot it is about.
+- If you disconnect a guide or an audio in the middle, the ones below move up one slot and their frame indexes move with them.
+- **Audio guides:** connect a soundtrack to `audio_0` and an `audio_1` slot appears, each with its own `audio_frame_idx` (where that audio starts; cropped to the video's remaining duration, like Add Guide). An audio at the same frame as an image guide joins it as one guide, exactly like Add Guide with both an image and an audio connected; an audio at any other frame is an audio-only guide.
+- Works with the V2V and Long Generation nodes: each window gets the guides that fall inside it.
 
 ## Long Generation node (text / image to video)
 

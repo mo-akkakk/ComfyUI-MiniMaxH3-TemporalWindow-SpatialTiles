@@ -159,12 +159,89 @@ class MiniMaxH3LongGeneration(io.ComfyNode):
         return io.NodeOutput(apply(model, wrapper), recording_clip(clip, record_all=True) if clip is not None else None)
 
 
+MAX_GUIDES = 16
+
+
+class MiniMaxH3MultiGuide(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3MultiGuide",
+            display_name="Minimax H3 Multi Guide (mo-akkakk)",
+            category="model/conditioning/minimax",
+            search_aliases=["h3 add guide", "h3 multiple guides", "h3 keyframes", "minimax guide frames", "mo-akkakk"],
+            description="Add Guide for MiniMax H3, for many guides in one node. Connect an image (or a clip) to guide_0 and a new "
+                        "guide slot appears, each with its own frame_idx; audio guides work the same way with audio_frame_idx. "
+                        "Each guide is anchored exactly like the native Add Guide node (an image and an audio at the same frame "
+                        "become one guide, as in Add Guide), so this is the same as chaining one Add Guide per guide.",
+            inputs=[
+                io.Conditioning.Input("positive"),
+                io.Latent.Input("latent", tooltip="The MiniMax H3 AV latent (from Reference to Video, Image to Video...)."),
+                io.Vae.Input("vae", optional=True, tooltip="Video VAE, needed when an image guide is connected."),
+                io.Vae.Input("audio_vae", optional=True, tooltip="Audio VAE, needed when an audio guide is connected."),
+                io.Autogrow.Input("guides", optional=True, template=io.Autogrow.TemplatePrefix(
+                    input=io.Image.Input("guide", optional=True,
+                                         tooltip="An image, or a clip (anchored as a clip of 5, 22, 39... (17k+5) frames, cropped "
+                                                 "down to that length; clips under 5 frames use their first image)."),
+                    prefix="guide_", min=1, max=MAX_GUIDES)),
+                io.Autogrow.Input("audios", optional=True, template=io.Autogrow.TemplatePrefix(
+                    input=io.Audio.Input("audio", optional=True,
+                                         tooltip="Soundtrack to anchor starting at its audio_frame_idx, cropped to the video's "
+                                                 "remaining duration."),
+                    prefix="audio_", min=1, max=MAX_GUIDES)),
+            ] + [
+                io.Int.Input("frame_idx_{}".format(i), default=0, min=-9999, max=9999,
+                             tooltip="Frame to anchor guide_{} (or its clip's first frame) at. Negative values count from the end "
+                                     "of the video: -1 = last frame.".format(i))
+                for i in range(MAX_GUIDES)
+            ] + [
+                io.Int.Input("audio_frame_idx_{}".format(i), default=0, min=-9999, max=9999,
+                             tooltip="Frame to start audio_{} at. Negative values count from the end of the video. Same frame as "
+                                     "an image guide = one guide with both, like Add Guide with image and audio.".format(i))
+                for i in range(MAX_GUIDES)
+            ],
+            outputs=[io.Conditioning.Output(display_name="positive")],
+        )
+
+    @classmethod
+    def execute(cls, positive, latent, vae=None, audio_vae=None, guides=None, audios=None, **idx) -> io.NodeOutput:
+        from comfy_extras.nodes_minimax_h3 import FRAME_PER_TOKEN, MiniMaxH3AddGuide
+        video = latent["samples"].tensors[0] if getattr(latent["samples"], "is_nested", False) else None
+        frame_count = sum(FRAME_PER_TOKEN[k % 5] for k in range(video.shape[2])) if video is not None else 0
+        resolve = lambda f: f if f >= 0 else frame_count + f
+        images = [("guide_{}".format(i), idx.get("frame_idx_{}".format(i), 0), (guides or {}).get("guide_{}".format(i)))
+                  for i in range(MAX_GUIDES)]
+        sounds = [("audio_{}".format(i), idx.get("audio_frame_idx_{}".format(i), 0), (audios or {}).get("audio_{}".format(i)))
+                  for i in range(MAX_GUIDES)]
+        images = [g for g in images if g[2] is not None]
+        sounds = [a for a in sounds if a[2] is not None]
+        if not images and not sounds:
+            raise ValueError("Minimax H3 Multi Guide: connect an image to guide_0 (or an audio to audio_0)")
+        jobs = []
+        for name, f, image in images:
+            # an audio guide at the same frame joins this image, like Add Guide with both inputs
+            match = next((a for a in sounds if resolve(a[1]) == resolve(f)), None)
+            if match is not None:
+                sounds.remove(match)
+                jobs.append((name + " + " + match[0], f, image, match[2]))
+            else:
+                jobs.append((name, f, image, None))
+        jobs += [(name, f, None, audio) for name, f, audio in sounds]
+        for name, f, image, audio in jobs:
+            try:
+                positive = MiniMaxH3AddGuide.execute(positive=positive, latent=latent, frame_idx=f, vae=vae,
+                                                     audio_vae=audio_vae, image=image, audio=audio).args[0]
+            except ValueError as e:
+                raise ValueError("Minimax H3 Multi Guide, {}: {}".format(name, e)) from e
+        return io.NodeOutput(positive)
+
+
 class MiniMaxH3WindowExtension(ComfyExtension):
     async def get_node_list(self):
-        return [MiniMaxH3TemporalWindow, MiniMaxH3LongGeneration]
+        return [MiniMaxH3TemporalWindow, MiniMaxH3LongGeneration, MiniMaxH3MultiGuide]
 
 
-WEB_DIRECTORY = "./js"  # tile_mode_ui.js: shows only the tile settings of the chosen tile_mode
+WEB_DIRECTORY = "./js"  # tile_mode_ui.js: chosen tile_mode's settings only; multi_guide_ui.js: one frame_idx per guide
 
 
 async def comfy_entrypoint() -> MiniMaxH3WindowExtension:

@@ -83,6 +83,15 @@ class FakeClip:
         return [[torch.randn(1, n, TEXT_DIM, generator=g), {"minimax_token_tags": torch.ones(1, n, dtype=torch.long)}]]
 
 
+class FakeAudioVAE:
+    audio_sample_rate = 32000
+
+    def encode(self, wave):  # [1, L, C] -> [1, 32, 2, T] at 40 Hz, deterministic from the content
+        t = max(1, wave.shape[1] * 40 // self.audio_sample_rate)
+        g = torch.Generator().manual_seed(int(abs(float(wave.float().sum())) * 1e3) % (2 ** 31))
+        return torch.randn(1, 32, 2, t, generator=g)
+
+
 class FakeVAE:
     def encode(self, frames):
         t = 1 if frames.shape[0] == 1 else h3.video_latent_t(frames.shape[0])
@@ -675,6 +684,53 @@ def test_tile_sync(model):
           not torch.allclose(outs[True][0], outs[False][0]) and bool(torch.isfinite(outs[True][1]).all()))
 
 
+def test_multi_guide(model):
+    W, H, N = 384, 256, 124
+    plate, ref = torch.rand(N, H, W, 3), torch.rand(1, H, W, 3)
+    pos, lat = conditioning(FakeClip(), plate, ref, W, H, N, guide=False)
+    imgs = [torch.rand(1, H, W, 3), torch.rand(1, H, W, 3), torch.rand(22, H, W, 3)]
+    idx = [0, -1, 40]
+    chained = pos
+    for im, i in zip(imgs, idx):
+        chained = h3.MiniMaxH3AddGuide.execute(chained, lat, i, vae=FakeVAE(), image=im).result[0]
+    # guide_1 left empty on purpose: slots are anchored in order, gaps skipped
+    guides = {"guide_0": imgs[0], "guide_2": imgs[1], "guide_3": imgs[2]}
+    frames = {"frame_idx_0": idx[0], "frame_idx_1": 77, "frame_idx_2": idx[1], "frame_idx_3": idx[2]}
+    multi = pack.MiniMaxH3MultiGuide.execute(pos, lat, vae=FakeVAE(), guides=guides, **frames).result[0]
+    a, b = chained[0][1]["minimax_keyframes"], multi[0][1]["minimax_keyframes"]
+    ok = len(a) == len(b) == 3
+    ok &= all(x["resolved_frame_index"] == y["resolved_frame_index"] and torch.equal(x["latent"], y["latent"]) for x, y in zip(a, b))
+    ok &= [k["resolved_frame_index"] for k in b] == [0, N - 1, 40] and b[2]["latent"].shape[2] == hw.tokens_for_frames(22)
+    check("Multi Guide = chaining native Add Guide per image (frames 0, -1 -> {}, a 22-frame clip at 40)".format(N - 1), bool(ok))
+    try:
+        pack.MiniMaxH3MultiGuide.execute(pos, lat, vae=FakeVAE(), guides={"guide_0": imgs[0], "guide_1": imgs[2]},
+                                         frame_idx_0=0, frame_idx_1=N - 5)
+        ok = False
+    except ValueError as e:
+        ok = "guide_1" in str(e)
+    check("Multi Guide names the guide slot in errors (clip past the end)", ok)
+    m, c = patch(model, FakeClip(), frames=56, overlap=22)
+    pos2, lat2 = conditioning(c, plate, ref, W, H, N, guide=False)
+    pos2 = pack.MiniMaxH3MultiGuide.execute(pos2, lat2, vae=FakeVAE(), guides=guides, **frames).result[0]
+    sigmas = comfy.samplers.calculate_sigmas(m.get_model_object("model_sampling"), "simple", 2)
+    out = run(m, pos2, lat2, sigmas)[0]["samples"].unbind()[0]
+    check("Multi Guide guides run through the windowed sampler", bool(torch.isfinite(out).all()))
+    # audio guides: one at an image's frame joins that image (like Add Guide with both), one alone stays audio-only
+    aud = [{"waveform": torch.randn(1, 2, 44100 * 2), "sample_rate": 44100}, {"waveform": torch.randn(1, 2, 44100), "sample_rate": 44100}]
+    av = FakeAudioVAE()
+    chained = h3.MiniMaxH3AddGuide.execute(pos, lat, 40, vae=FakeVAE(), audio_vae=av, image=imgs[2], audio=aud[0]).result[0]
+    chained = h3.MiniMaxH3AddGuide.execute(chained, lat, -30, audio_vae=av, audio=aud[1]).result[0]
+    multi = pack.MiniMaxH3MultiGuide.execute(pos, lat, vae=FakeVAE(), audio_vae=av, guides={"guide_0": imgs[2]},
+                                             audios={"audio_0": aud[1], "audio_1": aud[0]}, frame_idx_0=40,
+                                             audio_frame_idx_0=-30, audio_frame_idx_1=40).result[0]
+    a, b = chained[0][1]["minimax_keyframes"], multi[0][1]["minimax_keyframes"]
+    ok = len(a) == len(b) == 2 and "latent" not in b[1]
+    for x, y in zip(a, b):
+        ok &= x["resolved_frame_index"] == y["resolved_frame_index"] and set(x) == set(y)
+        ok &= all(torch.equal(x[k], y[k]) for k in ("latent", "audio_latent") if k in x)
+    check("Multi Guide audio: audio at an image's frame joins it, an audio alone is an audio-only guide (= native Add Guide)", bool(ok))
+
+
 if __name__ == "__main__":
 
 
@@ -697,6 +753,7 @@ if __name__ == "__main__":
         test_tile_carry(model)
         test_carry_frames(model)
         test_tile_sync(model)
+        test_multi_guide(model)
         test_full_res_plate(model)
         test_long_generation(model)
     print("\n{} failure(s)".format(len(FAILS)))
