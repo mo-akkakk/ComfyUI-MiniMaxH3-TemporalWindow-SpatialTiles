@@ -4,6 +4,10 @@
 
 by Mohamed ([mo-akkakk](https://registry.comfy.org/publishers/mo-akkakk))
 
+[![Watch the video on YouTube](https://img.youtube.com/vi/_lVzzLr9aC4/hqdefault.jpg)](https://www.youtube.com/watch?v=_lVzzLr9aC4)
+
+▶ [Watch the video on YouTube](https://www.youtube.com/watch?v=_lVzzLr9aC4)
+
 Long and high-resolution video-to-video for the **open-weights MiniMax H3** in native ComfyUI. It is one node that goes after the model:
 
 - **Temporal windows:** a long shot is generated as overlapping windows, one after another, each one continuing smoothly from the last.
