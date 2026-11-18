@@ -527,7 +527,7 @@ class WindowsWrapper:
     def __init__(self, window_frames, overlap_frames, carry_overlap, tile_h, tile_w, tile_overlap, crop_images,
                  min_final_frames=0, tile_audio="generate_once", color_match=False, tile_carry="own_tile",
                  plate=None, vae=None, plate_scale=1.0, schedule=None, image_policy="own_window", continuous=True,
-                 tile_counts=None, carry_frames=0):
+                 tile_counts=None, carry_frames=0, carry_mode="guide"):
         self.schedule = schedule          # None = V2V node; a list (maybe empty) = Long Generation node
         self.image_policy = image_policy
         self.continuous = continuous
@@ -543,6 +543,10 @@ class WindowsWrapper:
         self.tile_counts = tile_counts    # (across, down): tile size follows from the frame size at sampling time
         self.carry_frames = carry_frames  # 0 = the whole overlap; else only the last carry_frames of it guide the window
         self.crop_images = crop_images
+        # guide: the carried frames are a guide clip and the window regenerates its overlap (crossfaded);
+        # prefix: the carried frames are put into the window itself as clean, frozen frames (denoise mask 0):
+        # nothing is regenerated, no extra tokens, and the hand-off is exact
+        self.carry_mode = carry_mode
         self.tile_sync = tile_carry == "sync"  # tiles take every sampling step together, overlaps averaged each step
         self.warned = set()
 
@@ -580,6 +584,21 @@ class WindowsWrapper:
                     kfi = {kf["resolved_frame_index"] for kf in (c.get("minimax_keyframes") or [])}
                     img_at[id(src)] = image_frames(len(src["images"]), kfi, total)
         return {"compose": compose, "image_frames": img_at, "policy": self.image_policy}
+
+    @staticmethod
+    def prefix_window(lat_w, lat_a, mask_w, mask_a, c_lat, c_audio, a_off):
+        """prefix carry: put the carried frames (c_lat, first tokens of the window) and their audio (c_audio, from
+        audio tick a_off of the window) into the window latent, and mark them clean (mask 0) so they are kept."""
+        lat_w, lat_a = lat_w.clone(), lat_a.clone()
+        mask_w = torch.ones_like(lat_w) if mask_w is None else mask_w.clone()
+        mask_a = torch.ones_like(lat_a) if mask_a is None else mask_a.clone()
+        n = c_lat.shape[2]
+        lat_w[:, :, :n] = c_lat.to(lat_w.dtype)
+        mask_w[:, :, :n] = 0
+        if c_audio is not None and c_audio.shape[-1] > 0:
+            lat_a[..., a_off:a_off + c_audio.shape[-1]] = c_audio.to(lat_a.dtype)
+            mask_a[..., a_off:a_off + c_audio.shape[-1]] = 0
+        return comfy.utils.pack_latents([lat_w, lat_a])[0], comfy.utils.pack_latents([mask_w, mask_a])[0]
 
     def sample_window_sync(self, executor, guider, tile_conds, tile_shapes, boxes, weights, p_noise, p_lat, p_mask,
                            shapes, sampler, sigmas, disable_pbar, seed):
@@ -732,9 +751,10 @@ class WindowsWrapper:
                 a0 = 0 if t0 == 0 else min(audio_ticks(frames_for_tokens(t0)), audio_t)
                 a1 = audio_t if wi == len(windows) - 1 else min(audio_t, a0 + audio_ticks(frames_for_tokens(tn)))
                 carry_t = carry_s = 0
+                c_a0 = c_a1 = a0
                 if self.carry_overlap and done_t > t0:
                     carry_t = tokens_for_frames(frames_for_tokens(done_t - t0))
-                    if self.carry_frames:
+                    if self.carry_frames and self.carry_mode != "prefix":
                         # only the last carry_frames of the overlap, right before the window's new frames: fewer
                         # extra tokens (less memory); the whole overlap is still crossfaded
                         short = min(carry_t, tokens_for_frames(self.carry_frames))
@@ -743,6 +763,7 @@ class WindowsWrapper:
                 win_a = None
                 weight = torch.zeros((1, 1, 1, lat_h, lat_w))
                 sync = split_space and self.tile_sync
+                prefix_mode = self.carry_mode == "prefix" and carry_t > 0
                 own_carry = split_space and self.tile_carry == "own_tile" and not sync
                 cur_tiles = {}
                 sync_conds, sync_shapes = [], []
@@ -769,6 +790,10 @@ class WindowsWrapper:
                             c_a1 = min(done_a, audio_ticks(f_abs + fs + frames_for_tokens(carry_t)))
                         if c_a1 > c_a0:
                             carry["audio_latent"] = out_a[..., c_a0:c_a1].clone()
+                    prefix = None
+                    if prefix_mode and carry is not None:
+                        prefix = (carry["latent"], carry.get("audio_latent"), c_a0 - a0)
+                        carry = None
                     guider.conds = piece_conds(base_conds, t0, t0 + tn, ys[yi] if split_space else None,
                                                xs[xi] if split_space else None, lat_h, lat_w, self.crop_images,
                                                carry, self.warned, text_cache, self.plate, gen)
@@ -782,6 +807,10 @@ class WindowsWrapper:
                     p_mask = None
                     if masks is not None:
                         p_mask = comfy.utils.pack_latents([masks[0].expand(vshape)[vs], masks[1].expand(ashape)[..., a0:a1]])[0]
+                    if prefix is not None:
+                        p_lat, p_mask = self.prefix_window(
+                            lat_v[vs], lat_a[..., a0:a1], masks[0].expand(vshape)[vs] if masks is not None else None,
+                            masks[1].expand(ashape)[..., a0:a1] if masks is not None else None, *prefix)
                     res = executor(p_noise, p_lat, sampler, sigmas, p_mask, None, disable_pbar, seed, latent_shapes=shapes)
                     rv, ra = comfy.utils.unpack_latents(res, shapes)[:2]
                     rv = rv.float().cpu()
@@ -808,12 +837,19 @@ class WindowsWrapper:
                     p_mask = None
                     if masks is not None:
                         p_mask = comfy.utils.pack_latents([masks[0].expand(vshape)[vs], masks[1].expand(ashape)[..., a0:a1]])[0]
+                    p_lat = comfy.utils.pack_latents([lat_v[vs], lat_a[..., a0:a1]])[0]
+                    if prefix_mode and carry_t:
+                        # sync: the prefix is the agreed (blended) picture; each tile model call sees its crop of it
+                        c_audio = out_a[..., c_a0:c_a1] if c_a1 > c_a0 else None
+                        p_lat, p_mask = self.prefix_window(
+                            lat_v[vs], lat_a[..., a0:a1], masks[0].expand(vshape)[vs] if masks is not None else None,
+                            masks[1].expand(ashape)[..., a0:a1] if masks is not None else None,
+                            out_v[:, :, t0:t0 + carry_t].clone(), c_audio, c_a0 - a0)
                     boxes = [(ys[yi][0], ys[yi][1], xs[xi][0], xs[xi][1]) for yi, xi in tiles]
                     win_v, win_a = self.sample_window_sync(
                         executor, guider, sync_conds, sync_shapes, boxes, [tile_weight(ys, xs, yi, xi) for yi, xi in tiles],
                         comfy.utils.pack_latents([noise_v[vs], noise_a[..., a0:a1]])[0],
-                        comfy.utils.pack_latents([lat_v[vs], lat_a[..., a0:a1]])[0], p_mask, shapes, sampler, sigmas,
-                        disable_pbar, seed)
+                        p_lat, p_mask, shapes, sampler, sigmas, disable_pbar, seed)
                 else:
                     win_v /= weight
                 prev_tiles = cur_tiles

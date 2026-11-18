@@ -130,6 +130,16 @@ def patch(model, clip, frames=124, overlap=22, tiles=False, tw=960, th=544, tov=
         color_match=color_match, plate_scale=plate_scale, clip=clip, plate=plate, vae=vae).result
 
 
+def patch2(model, clip, frames=124, carry_mode="prefix", carry_prefix=22, overlap=22, tiles=False, tw=960, th=544, tov=256,
+           tile_carry="sync", tile_audio="generate_once", short_final=False, min_final=22, color_match=False):
+    return pack.MiniMaxH3V2V.execute(
+        model=model, temporal_windows=frames > 0, window_frames=max(frames, 22), short_final_window=short_final,
+        min_final_window_frames=min_final, carry_mode=carry_mode, carry_prefix_frames=carry_prefix, overlap_frames=overlap,
+        spatial_tiles=tiles, plate_scale=1.0, tile_carry=tile_carry, tile_audio=tile_audio, tile_mode="tile_size",
+        tile_width=tw, tile_height=th, tiles_across=2, tiles_down=2, tile_overlap=tov, crop_ref_images_per_tile=True,
+        color_match=color_match, clip=clip).result
+
+
 def test_plans():
     for frames in (124, 209, 362, 719):
         T = h3.temporal_shape(frames)[1]
@@ -731,6 +741,60 @@ def test_multi_guide(model):
     check("Multi Guide audio: audio at an image's frame joins it, an audio alone is an audio-only guide (= native Add Guide)", bool(ok))
 
 
+def test_prefix(model):
+    W, H, N = 384, 256, 175
+    plate, ref = torch.rand(N, H, W, 3), torch.rand(1, H, W, 3)
+    sigmas = None
+    for label, kw in (("windows", {}), ("own_tile tiles", {"tiles": True, "tw": 256, "th": 160, "tov": 64, "tile_carry": "own_tile"}),
+                      ("sync tiles", {"tiles": True, "tw": 256, "th": 160, "tov": 64, "tile_carry": "sync"})):
+        m, c = patch2(model, FakeClip(), frames=73, carry_mode="prefix", carry_prefix=22, **kw)
+        pos, lat = conditioning(c, plate, ref, W, H, N, guide=False)
+        carries = []
+        orig_pc = hw.piece_conds
+
+        def spy(conds, k0, k1, ys_, xs_, *a, **kw2):
+            carries.append(a[3])
+            return orig_pc(conds, k0, k1, ys_, xs_, *a, **kw2)
+        hw.piece_conds = spy
+        try:
+            sigmas = comfy.samplers.calculate_sigmas(m.get_model_object("model_sampling"), "simple", 2)
+            out, pieces = sample_pieces(m, pos, lat, sigmas)
+        finally:
+            hw.piece_conds = orig_pc
+        latent_t = lat["samples"].unbind()[0].shape[2]
+        windows = hw.plan_windows(latent_t, 73, 22)
+        ct = hw.tokens_for_frames(22)
+        per_win = len(pieces) // len(windows)
+        ok = len(windows) >= 3 and all(cc is None for cc in carries[-len(pieces):]) and bool(torch.isfinite(out[0]).all())
+        for j, p in enumerate(pieces):
+            wi = j // per_win
+            mv, ma = p["mask"][:2] if p["mask"] is not None else (None, None)
+            if wi == 0:
+                ok &= mv is None or bool((mv == 1).all())
+                continue
+            ok &= mv is not None and bool((mv[:, :, :ct] == 0).all()) and bool((mv[:, :, ct:] == 1).all())
+            ok &= bool((ma[..., :1] == 0).all()) and bool((ma[..., -1:] == 1).all())
+            # the frozen frames come out exactly as they went in
+            ok &= torch.allclose(p["out"][0][:, :, :ct].float(), p["lat"][0][:, :, :ct].float(), atol=1e-4)
+        # and they are exactly the previous window's frames in the final output (no crossfade change)
+        t1 = windows[1][0]
+        if label == "windows":
+            ok &= torch.allclose(out[0][:, :, t1:t1 + ct].float(), pieces[0]["out"][0][:, :, t1:t1 + ct].float(), atol=1e-4)
+        check("prefix carry ({}): windows 2-{} start with the previous window's last 22 frames, frozen (mask 0, "
+              "no guide, kept exactly), audio too".format(label, len(windows)), bool(ok))
+    # carry_frames mode = the OLD node with the same settings
+    a = run(*patch(model, FakeClip(), frames=73, overlap=39, carry_frames=22)[:1], *conditioning(patch(model, FakeClip(), frames=73, overlap=39, carry_frames=22)[1], plate, ref, W, H, N), sigmas)
+    b = run(*patch2(model, FakeClip(), frames=73, carry_mode="carry_frames", carry_prefix=22, overlap=39)[:1], *conditioning(patch2(model, FakeClip(), frames=73, carry_mode="carry_frames", carry_prefix=22, overlap=39)[1], plate, ref, W, H, N), sigmas)
+    check("new node in carry_frames mode = OLD node (overlap 39, carry 22), bit-identical",
+          torch.equal(a[0]["samples"].unbind()[0], b[0]["samples"].unbind()[0]))
+    try:
+        patch2(model, FakeClip(), frames=56, carry_prefix=56)
+        ok = False
+    except ValueError as e:
+        ok = "carry_prefix_frames" in str(e)
+    check("prefix as long as the window is refused with a clear message", ok)
+
+
 if __name__ == "__main__":
 
 
@@ -754,6 +818,7 @@ if __name__ == "__main__":
         test_carry_frames(model)
         test_tile_sync(model)
         test_multi_guide(model)
+        test_prefix(model)
         test_full_res_plate(model)
         test_long_generation(model)
     print("\n{} failure(s)".format(len(FAILS)))

@@ -8167,7 +8167,7 @@
     },
     {
       "id": 10093,
-      "type": "MiniMaxH3TemporalWindow",
+      "type": "MiniMaxH3V2V",
       "pos": [
         7510,
         6910
@@ -8206,177 +8206,6 @@
           "shape": 7,
           "type": "VAE",
           "link": 21202
-        },
-        {
-          "localized_name": "temporal_windows",
-          "name": "temporal_windows",
-          "type": "BOOLEAN",
-          "widget": {
-            "name": "temporal_windows"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "window_frames",
-          "name": "window_frames",
-          "type": "INT",
-          "widget": {
-            "name": "window_frames"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "overlap_frames",
-          "name": "overlap_frames",
-          "type": "INT",
-          "widget": {
-            "name": "overlap_frames"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "short_final_window",
-          "name": "short_final_window",
-          "type": "BOOLEAN",
-          "widget": {
-            "name": "short_final_window"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "min_final_window_frames",
-          "name": "min_final_window_frames",
-          "type": "INT",
-          "widget": {
-            "name": "min_final_window_frames"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "carry_overlap",
-          "name": "carry_overlap",
-          "type": "BOOLEAN",
-          "widget": {
-            "name": "carry_overlap"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "carry_frames",
-          "name": "carry_frames",
-          "type": "INT",
-          "widget": {
-            "name": "carry_frames"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "spatial_tiles",
-          "name": "spatial_tiles",
-          "type": "BOOLEAN",
-          "widget": {
-            "name": "spatial_tiles"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "tile_mode",
-          "name": "tile_mode",
-          "type": "COMBO",
-          "widget": {
-            "name": "tile_mode"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "tile_width",
-          "name": "tile_width",
-          "type": "INT",
-          "widget": {
-            "name": "tile_width"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "tile_height",
-          "name": "tile_height",
-          "type": "INT",
-          "widget": {
-            "name": "tile_height"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "tiles_across",
-          "name": "tiles_across",
-          "type": "INT",
-          "widget": {
-            "name": "tiles_across"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "tiles_down",
-          "name": "tiles_down",
-          "type": "INT",
-          "widget": {
-            "name": "tiles_down"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "tile_overlap",
-          "name": "tile_overlap",
-          "type": "INT",
-          "widget": {
-            "name": "tile_overlap"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "tile_carry",
-          "name": "tile_carry",
-          "type": "COMBO",
-          "widget": {
-            "name": "tile_carry"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "tile_audio",
-          "name": "tile_audio",
-          "type": "COMBO",
-          "widget": {
-            "name": "tile_audio"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "crop_ref_images_per_tile",
-          "name": "crop_ref_images_per_tile",
-          "type": "BOOLEAN",
-          "widget": {
-            "name": "crop_ref_images_per_tile"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "color_match",
-          "name": "color_match",
-          "type": "BOOLEAN",
-          "widget": {
-            "name": "color_match"
-          },
-          "link": null
-        },
-        {
-          "localized_name": "plate_scale",
-          "name": "plate_scale",
-          "type": "FLOAT",
-          "widget": {
-            "name": "plate_scale"
-          },
-          "link": null
         }
       ],
       "outputs": [
@@ -8416,29 +8245,29 @@
           "color_restricted": 0
         },
         "cnr_id": "comfyui-minimax-h3-temporal-window-spatial-tiles",
-        "ver": "1.3.0",
-        "Node name for S&R": "MiniMaxH3TemporalWindow"
+        "ver": "1.5.0",
+        "Node name for S&R": "MiniMaxH3V2V"
       },
       "widgets_values": [
         true,
         124,
-        22,
         false,
         22,
-        true,
+        "prefix",
+        22,
         22,
         false,
+        1.0,
+        "sync",
+        "generate_once",
         "tile_size",
         960,
         544,
         2,
         2,
         256,
-        "sync",
-        "generate_once",
         true,
-        false,
-        1.0
+        false
       ],
       "widgets_values_named": {
         "temporal_windows": true,

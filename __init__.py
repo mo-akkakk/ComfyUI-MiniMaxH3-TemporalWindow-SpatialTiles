@@ -8,10 +8,12 @@ class MiniMaxH3TemporalWindow(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="MiniMaxH3TemporalWindow",
-            display_name="Minimax H3 V2V Temporal Window & Spatial Tiles (mo-akkakk)",
+            display_name="Minimax H3 V2V Temporal Window & Spatial Tiles OLD (mo-akkakk)",
             category="model/patch/minimax",
             search_aliases=["h3 temporal window", "h3 spatial tiles", "h3 long video", "minimax overlap", "context windows", "mo-akkakk"],
-            description="Put after the model, and route the CLIP through it into Reference to Video. "
+            description="The 1.4.0 layout of the V2V node, kept so saved workflows keep their settings. For new workflows use "
+                        "'Minimax H3 V2V Temporal Window & Spatial Tiles' (prefix carry, tidier settings). "
+                        "Put after the model, and route the CLIP through it into Reference to Video. "
                         "Samples the video as overlapping temporal windows, one after another: each window is a normal H3 run on its "
                         "slice of the plate, starts from the previous window's finished overlap frames (frame-0 guide), and the "
                         "overlap is crossfaded. Optional spatial tiles, each following its crop of the plate. Works with KSampler and SamplerCustomAdvanced.",
@@ -236,9 +238,119 @@ class MiniMaxH3MultiGuide(io.ComfyNode):
         return io.NodeOutput(positive)
 
 
+class MiniMaxH3V2V(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3V2V",
+            display_name="Minimax H3 V2V Temporal Window & Spatial Tiles (mo-akkakk)",
+            category="model/patch/minimax",
+            search_aliases=["h3 temporal window", "h3 spatial tiles", "h3 long video", "h3 prefix", "minimax overlap",
+                            "context windows", "mo-akkakk"],
+            description="Put after the model, and route the CLIP through it into Reference to Video. Samples the video as "
+                        "temporal windows, one after another, each continuing from the previous one (prefix: the previous "
+                        "window's last frames are put into the next window as frozen frames, so the hand-off is exact), and "
+                        "optionally as spatial tiles, each following its crop of the plate. Works with KSampler and "
+                        "SamplerCustomAdvanced.",
+            inputs=[
+                io.Model.Input("model"),
+                io.Clip.Input("clip", optional=True,
+                              tooltip="Route the CLIP through here into Reference to Video so each window (and tile) re-encodes "
+                                      "the prompt with only its own slice of <Video N>. Strongly recommended."),
+                io.Image.Input("plate", optional=True,
+                               tooltip="Optional, for tiles: the full-resolution version of the video you feed as ref_video_0 "
+                                       "(same frames, same order, at least as long). Each tile's plate piece is then cut from it "
+                                       "exactly and at full detail. Needs vae. See plate_scale."),
+                io.Vae.Input("vae", optional=True, tooltip="Video VAE, used with plate to encode each tile's plate piece."),
+                io.Boolean.Input("temporal_windows", default=True,
+                                 tooltip="Split the shot into temporal windows. Off = the whole length runs as one native H3 pass."),
+                io.Int.Input("window_frames", default=124, min=22, max=3600, step=17,
+                             tooltip="Frames per window (17k+5), including the carried frames. Keep it inside what works "
+                                     "natively for you, e.g. <= 192."),
+                io.Boolean.Input("short_final_window", default=False,
+                                 tooltip="Let the last window be shorter than window_frames instead of pulling it back to full length."),
+                io.Int.Input("min_final_window_frames", default=22, min=5, max=3600, step=17,
+                             tooltip="With short_final_window on: the last window is never shorter than this (17k+5)."),
+                io.Combo.Input("carry_mode", options=["prefix", "carry_frames"], default="prefix",
+                               tooltip="How each window continues from the previous one. "
+                                       "prefix (default): the previous window's last carry_prefix_frames are put into the start "
+                                       "of the next window as frozen frames. They are not generated again, so the hand-off is "
+                                       "exact (no crossfade, no ghosting at the join) and they add no extra tokens. "
+                                       "carry_frames: the 1.4.0 method. Windows overlap by overlap_frames, the next window "
+                                       "regenerates the overlap guided by the previous window's last carry_prefix_frames "
+                                       "(extra tokens), and the two versions are crossfaded."),
+                io.Int.Input("carry_prefix_frames", default=22, min=5, max=1000, step=17,
+                             tooltip="prefix: how many frames of the previous window start the next one, frozen (5, 22, 39...). "
+                                     "Must be less than window_frames. "
+                                     "carry_frames: how many of the overlap frames guide the next window (capped at overlap_frames)."),
+                io.Int.Input("overlap_frames", default=22, min=5, max=1000, step=17,
+                             tooltip="carry_mode = carry_frames only: frames shared by neighbouring windows (5, 22, 39...). "
+                                     "The next window regenerates them and they are crossfaded."),
+                io.Boolean.Input("spatial_tiles", default=False,
+                                 tooltip="Split each window into overlapping tiles, for stage 1 or stage 2. Each tile follows its "
+                                         "crop of the plate. Without a reference video, a full-denoise pass in tiles repeats the subject."),
+                io.Float.Input("plate_scale", default=1.0, min=0.25, max=1.0, step=0.05,
+                               tooltip="Only with the plate input connected. Size of each tile's plate piece relative to the tile. "
+                                       "1.0 = full detail (slowest). 0.5 = a quarter of the reference tokens, much faster, "
+                                       "still exactly aligned."),
+                io.Combo.Input("tile_carry", options=["sync", "own_tile", "blended"], default="sync",
+                               tooltip="How tiles are sampled and continued. sync (recommended) = all tiles take every sampling step "
+                                       "together and their overlaps are averaged after each step, so neighbouring tiles agree "
+                                       "(no ghosting on fast motion); each window continues from the agreed picture. "
+                                       "own_tile = each tile is sampled on its own, blended at the end, and continues from its own "
+                                       "frames. blended = like own_tile but continues from the blended picture."),
+                io.Combo.Input("tile_audio", options=["generate_once", "keep_input"], default="generate_once",
+                               tooltip="With tiles: generate_once = use the soundtrack generated by the first tile. "
+                                       "keep_input = output the incoming audio latent untouched (stage 2, when stage 1's audio is final)."),
+                io.Combo.Input("tile_mode", options=["tile_size", "tile_count"], default="tile_size",
+                               tooltip="How tiles are set. tile_size: use tile_width / tile_height (pixels). tile_count: split the "
+                                       "frame into tiles_across x tiles_down tiles. Both use tile_overlap."),
+                io.Int.Input("tile_width", default=960, min=256, max=16384, step=32,
+                             tooltip="Tile width in pixels (tile_mode = tile_size)."),
+                io.Int.Input("tile_height", default=544, min=256, max=16384, step=32,
+                             tooltip="Tile height in pixels (tile_mode = tile_size)."),
+                io.Int.Input("tiles_across", default=2, min=1, max=16,
+                             tooltip="With tile_mode = tile_count: number of tiles horizontally."),
+                io.Int.Input("tiles_down", default=2, min=1, max=16,
+                             tooltip="With tile_mode = tile_count: number of tiles vertically."),
+                io.Int.Input("tile_overlap", default=256, min=0, max=8192, step=32,
+                             tooltip="Pixels shared by neighbouring tiles, used in both tile modes."),
+                io.Boolean.Input("crop_ref_images_per_tile", default=True,
+                                 tooltip="With tiles, crop <Picture N> to each tile too. On when the picture is a frame of this "
+                                         "shot; off for character/style references."),
+                io.Boolean.Input("color_match", default=False,
+                                 tooltip="Remove a small colour/brightness offset (per-channel median, clamped) between tiles "
+                                         "(own_tile/blended) and between a window and the previous one over their overlap."),
+            ],
+            outputs=[io.Model.Output(), io.Clip.Output()],
+        )
+
+    @classmethod
+    def execute(cls, model, temporal_windows, window_frames, short_final_window, min_final_window_frames, carry_mode,
+                carry_prefix_frames, overlap_frames, spatial_tiles, plate_scale, tile_carry, tile_audio, tile_mode,
+                tile_width, tile_height, tiles_across, tiles_down, tile_overlap, crop_ref_images_per_tile, color_match,
+                clip=None, plate=None, vae=None) -> io.NodeOutput:
+        if carry_mode == "prefix":
+            if temporal_windows and carry_prefix_frames >= window_frames:
+                raise ValueError("Minimax H3 V2V: carry_prefix_frames ({}) must be less than window_frames ({}), so each "
+                                 "window has new frames to make.".format(carry_prefix_frames, window_frames))
+            overlap, carry, mode = carry_prefix_frames, 0, "prefix"
+        else:
+            overlap, mode = overlap_frames, "guide"
+            carry = carry_prefix_frames if carry_prefix_frames < overlap_frames else 0
+        wrapper = WindowsWrapper(window_frames if temporal_windows else 0, overlap, True,
+                                 tile_height // 16 if spatial_tiles else 0, tile_width // 16 if spatial_tiles else 0,
+                                 tile_overlap // 16, crop_ref_images_per_tile,
+                                 min_final_window_frames if short_final_window else 0,
+                                 tile_audio, color_match, tile_carry, plate if spatial_tiles else None, vae, plate_scale,
+                                 tile_counts=(tiles_across, tiles_down) if spatial_tiles and tile_mode == "tile_count" else None,
+                                 carry_frames=carry, carry_mode=mode)
+        return io.NodeOutput(apply(model, wrapper), recording_clip(clip) if clip is not None else None)
+
+
 class MiniMaxH3WindowExtension(ComfyExtension):
     async def get_node_list(self):
-        return [MiniMaxH3TemporalWindow, MiniMaxH3LongGeneration, MiniMaxH3MultiGuide]
+        return [MiniMaxH3TemporalWindow, MiniMaxH3LongGeneration, MiniMaxH3MultiGuide, MiniMaxH3V2V]
 
 
 WEB_DIRECTORY = "./js"  # tile_mode_ui.js: chosen tile_mode's settings only; multi_guide_ui.js: one frame_idx per guide

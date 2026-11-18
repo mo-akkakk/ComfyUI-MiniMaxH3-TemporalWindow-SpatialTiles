@@ -10,14 +10,20 @@ by Mohamed ([mo-akkakk](https://registry.comfy.org/publishers/mo-akkakk))
 
 Long and high-resolution video-to-video for the **open-weights MiniMax H3** in native ComfyUI. It is one node that goes after the model:
 
-- **Temporal windows:** a long shot is generated as overlapping windows, one after another, each one continuing smoothly from the last.
+- **Temporal windows:** a long shot is generated as windows, one after another, each one starting from the last frames of the previous one.
 - **Spatial tiles:** a big frame is generated as overlapping tiles, each following its own part of your plate (the reference video).
 
 Both work in stage 1 (full denoise) and stage 2 (low-denoise refine).
 
-The pack also has a second node, **Minimax H3 Long Generation**, for long text-to-video and image-to-video without a reference video, with a prompt timeline so the story moves forward. See [Long Generation node](#long-generation-node-text--image-to-video). Nothing inside the model is patched: every window and tile is an ordinary native H3 run. With one window and no tiles, the output is bit-identical to the plain native workflow.
+The pack also has **Minimax H3 Multi Guide** (many guide frames in one node, see [Multi Guide node](#multi-guide-node)), **Minimax H3 V2V Temporal Window & Spatial Tiles OLD** (the 1.4.0 V2V node, kept for saved workflows), and **Minimax H3 Long Generation**, for long text-to-video and image-to-video without a reference video, with a prompt timeline so the story moves forward. See [Long Generation node](#long-generation-node-text--image-to-video). Nothing inside the model is patched: every window and tile is an ordinary native H3 run. With one window and no tiles, the output is bit-identical to the plain native workflow.
 
 ## What's new
+
+**1.5.0** — a new V2V node with **prefix carry**, and the old one kept as **OLD**
+- **Minimax H3 V2V Temporal Window & Spatial Tiles** is now a new node with tidier settings and a new way to join windows, `carry_mode` = **`prefix`** (the default): the previous window's last frames are put into the start of the next window as frozen frames. They are not generated again, so the hand-off is exact: no crossfade, no ghosting at the join, and no extra tokens (less memory, and faster than the old method in testing). The old method is still there as `carry_mode` = `carry_frames`.
+- The 1.4.0 node is renamed **Minimax H3 V2V Temporal Window & Spatial Tiles OLD**. It is unchanged, so **saved workflows keep their settings and render exactly as before**. For new workflows, use the new node.
+- The `carry_overlap` switch is gone from the new node (carrying is always on); `overlap_frames` only appears with `carry_mode` = `carry_frames`.
+- The example workflows now use the new node.
 
 **1.4.0** — new node: **Minimax H3 Multi Guide**
 - All your guide frames in one node instead of a chain of Add Guide nodes: connect an image (or a clip) to `guide_0` and the next guide slot appears, each with its own `frame_idx`; audio guides work the same way (`audio_0`, `audio_frame_idx_0`...). See [Multi Guide node](#multi-guide-node).
@@ -135,23 +141,26 @@ Everything else is the stock H3 workflow: Reference to Video (with your video as
 
 ## Settings
 
+The settings below are the new node's, in the order it shows them. The OLD node has the same settings in its 1.4.0 order, plus `carry_overlap` and always the `carry_frames` method.
+
 ### Temporal windows
 
 | Setting | What it does |
 |---|---|
-| `temporal_windows` | On: the shot is split into overlapping windows. Off: the whole length runs as one native pass (tiles still work). |
-| `window_frames` | Frames per window, on H3's 17k+5 grid (124 = 5.2 s, 175 = 7.3 s). Keep it within what H3 handles accurately on your setup. |
-| `overlap_frames` | Frames shared by neighbouring windows (5, 22, 39…). Bigger = smoother joins, a bit slower. 22 is a good default. |
+| `temporal_windows` | On: the shot is split into windows. Off: the whole length runs as one native pass (tiles still work). |
+| `window_frames` | Frames per window, including the carried frames, on H3's 17k+5 grid (124 = 5.2 s, 175 = 7.3 s). Keep it within what H3 handles accurately on your setup. |
 | `short_final_window` | Off (default): the last window is pulled back to a full `window_frames`, re-generating some frames at the end. On: the last window keeps its natural shorter length, saving time. |
 | `min_final_window_frames` | With `short_final_window` on: the shortest the last window may be (5, 22, 39, 56…). |
-| `carry_overlap` | On (recommended): each window starts from the previous window's finished overlap frames (video and audio), so motion continues without a jump. |
-| `carry_frames` | With `carry_overlap`: how many of those overlap frames (5, 22, 39…) guide the next window, taken right before its new frames. At or above `overlap_frames` = the whole overlap. Lower it (e.g. overlap 39, carry 22) if window 2 runs out of memory: the carried frames are extra tokens in every window after the first. |
+| `carry_mode` | How each window continues from the previous one. **`prefix`** (default): the previous window's last `carry_prefix_frames` frames are put into the start of the next window as frozen frames (video and audio). They are kept exactly, not generated again, so the join is exact, nothing is crossfaded, and no extra tokens are added. **`carry_frames`**: the 1.4.0 method: windows share `overlap_frames`, the next window regenerates them guided by the previous window's last `carry_prefix_frames` frames (extra tokens), and the two versions are crossfaded. |
+| `carry_prefix_frames` | `prefix`: how many frozen frames start each window after the first (5, 22, 39…); must be less than `window_frames`. 22 is a good default; more gives the next window more motion to continue from. `carry_frames`: how many of the overlap frames guide the next window (at or above `overlap_frames` = the whole overlap). |
+| `overlap_frames` | Only with `carry_mode` = `carry_frames`: frames shared by neighbouring windows (5, 22, 39…), regenerated and crossfaded. |
 
 ### Spatial tiles
 
 | Setting | What it does |
 |---|---|
 | `spatial_tiles` | On: each window is split into overlapping tiles. Needs a plate (a reference video): without one, a full-denoise pass in tiles repeats the subject in every tile. |
+| `plate_scale` | Only with the `plate` input connected: see [The plate input](#the-plate-input-optional). |
 | `tile_mode` | `tile_size` (default): tiles are `tile_width` × `tile_height` pixels, and as many as needed are used. `tile_count`: the frame is split into `tiles_across` × `tiles_down` tiles, and their size follows from the frame size and `tile_overlap` (the console prints the resulting tile size). |
 | `tile_width` / `tile_height` | With `tile_size`: tile size in pixels. Use a size H3 handles well on your setup (for example 960 × 544, or about 1 MP). |
 | `tiles_across` / `tiles_down` | With `tile_count`: how many tiles horizontally and vertically (1 = no split in that direction). Handy when the output size changes between shots. Keep the resulting tiles at a size H3 handles well. |
@@ -187,9 +196,9 @@ Everything else is the stock H3 workflow: Reference to Video (with your video as
 - **Use H3's reference tags in the prompt:** `<Video 1>`, `<Picture 1>`, `<Audio 1>` (counting from 1 for each kind). These are the labels Qwen actually sees; input names like `ref_video_0` are not.
 - **Avoid thin padding bars.** H3 works on 16 × 16-pixel blocks. If you pad a plate to round its size and the bars are thinner than about 16 px, H3 partly paints over them and the picture comes out slightly squashed and shifted. Use edge padding (repeat the last pixel), bars of 32 px or more, or crop instead of padding.
 - **Stage 2: check your real sigmas.** `BasicScheduler` with `denoise` does not start at that amount of noise: with `linear_quadratic`, denoise 0.4 actually starts at sigma 0.93, almost a full re-generation, and windows and tiles will then disagree. For a refine, start around 0.2–0.45 (e.g. with ManualSigmas).
-- **Seam where windows join:** increase `overlap_frames` (22 → 39).
+- **Seam where windows join:** use `carry_mode` = `prefix` (exact join). With `carry_frames`, increase `overlap_frames` (22 → 39). With `prefix`, if the motion changes character right after the frozen frames, try a longer `carry_prefix_frames` (22 → 39).
 - **Seam between tiles:** increase `tile_overlap`, then try `color_match`.
-- **Out of memory at window 2 (often on big cloud GPUs, e.g. "exceeds allowed memory" right after window 1).** From window 2 on, each window also holds the carried frames, so it is a bit bigger than window 1, and ComfyUI's built-in model compiler (the console shows `Comfy model compiler graph breaks`, part of dynamic VRAM) re-records for the new size. This is ComfyUI itself, not a torch compile node in the workflow. Fixes, in order: start ComfyUI with `--disable-comfy-compiler`; if it still fails, add `--disable-dynamic-vram`; then lower `carry_frames` (or `overlap_frames`) or `window_frames`.
+- **Out of memory at window 2 (often on big cloud GPUs, e.g. "exceeds allowed memory" right after window 1).** From window 2 on, each window also holds the carried frames, so it is a bit bigger than window 1, and ComfyUI's built-in model compiler (the console shows `Comfy model compiler graph breaks`, part of dynamic VRAM) re-records for the new size. This is ComfyUI itself, not a torch compile node in the workflow. Fixes, in order: start ComfyUI with `--disable-comfy-compiler`; if it still fails, add `--disable-dynamic-vram`; then lower `carry_frames` (or `overlap_frames`) or `window_frames`. With the new node's `prefix` mode this does not happen: a prefix adds no tokens, so every window has the same size.
 - **Fine texture flickering ("micro-boiling") at high resolution** comes mostly from the model and sampler (few-step LoRAs especially), not from tiling. Generating at about 1 MP and refining in stage 2 at low denoise is the most stable route to high resolution.
 
 ## Multi Guide node
@@ -284,10 +293,10 @@ The node registers an `OUTER_SAMPLE` wrapper on the model, so it works with any 
 
 1. It slices the noise and latent to the window, and the audio to the matching span on H3's 40 Hz audio grid.
 2. It re-times the native conditioning to the window: reference-video latents are sliced, guide frames are moved to window time (a guide clip crossing the window edge keeps its 17-frame chunks inside the window).
-3. It appends the previous window's finished overlap as a guide clip at frame 0.
+3. It continues from the previous window: with `prefix`, the previous window's last frames (and audio) are written into the start of this window's latent with a denoise mask of 0, so H3 treats them as clean, finished frames and keeps them; with `carry_frames`, they are appended as a guide clip and the window regenerates its overlap.
 4. It swaps in the per-window prompt encoding.
 5. With tiles, it runs each tile on its own crop of everything above — noise, latent, plate, guides and prompt — and feather-blends the tiles.
-6. It crossfades the window into the output.
+6. It writes the window into the output (with `carry_frames`, the regenerated overlap is crossfaded; with `prefix`, the frozen frames are already identical).
 
 Windows start on H3's 17-frame VAE-clip boundaries, so every window and every carried overlap is a valid H3 length.
 
