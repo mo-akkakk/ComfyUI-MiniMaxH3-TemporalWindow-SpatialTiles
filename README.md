@@ -19,6 +19,8 @@ The pack also has **Minimax H3 Multi Guide** (many guide frames in one node, see
 
 ## What's new
 
+**1.6.1** — fix: `prefix` carry stopped at window 2 with *"Expected all tensors to be on the same device, cuda:0 and cpu"* when the workflow had no noise mask of its own (seen with Long Generation; the V2V node is fixed too).
+
 **1.6.0** — prefix carry in **Long Generation**, and **until_step** in **Multi Guide**
 - **Long Generation** now has the same `carry_mode` as the new V2V node, with **`prefix`** as the default: the previous window's last `carry_prefix_frames` (39 by default) start the next window as frozen frames, for an exact hand-off with no extra tokens. `carry_frames` is the 1.5.0 method.
 - Its settings are reorganized like the new V2V node, and the `carry_overlap` switch is gone (carrying is always on). ⚠️ **Saved Long Generation workflows load with shifted values**: re-add the node, or switch to 1.5.0 in the Manager (*Switch Ver*) to read your old settings, then update. For exactly the 1.5.0 result, use `carry_mode` = `carry_frames` with `carry_prefix_frames` and `overlap_frames` both set to your old `overlap_frames`.

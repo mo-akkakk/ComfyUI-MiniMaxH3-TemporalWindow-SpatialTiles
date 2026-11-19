@@ -586,12 +586,13 @@ class WindowsWrapper:
         return {"compose": compose, "image_frames": img_at, "policy": self.image_policy}
 
     @staticmethod
-    def prefix_window(lat_w, lat_a, mask_w, mask_a, c_lat, c_audio, a_off):
+    def prefix_window(lat_w, lat_a, mask_w, mask_a, c_lat, c_audio, a_off, device):
         """prefix carry: put the carried frames (c_lat, first tokens of the window) and their audio (c_audio, from
-        audio tick a_off of the window) into the window latent, and mark them clean (mask 0) so they are kept."""
+        audio tick a_off of the window) into the window latent, and mark them clean (mask 0) so they are kept.
+        The mask goes on `device` (the sampling device), where the sampler expects denoise masks to be."""
         lat_w, lat_a = lat_w.clone(), lat_a.clone()
-        mask_w = torch.ones_like(lat_w) if mask_w is None else mask_w.clone()
-        mask_a = torch.ones_like(lat_a) if mask_a is None else mask_a.clone()
+        mask_w = torch.ones(lat_w.shape, dtype=lat_w.dtype, device=device) if mask_w is None else mask_w.to(device).clone()
+        mask_a = torch.ones(lat_a.shape, dtype=lat_a.dtype, device=device) if mask_a is None else mask_a.to(device).clone()
         n = c_lat.shape[2]
         lat_w[:, :, :n] = c_lat.to(lat_w.dtype)
         mask_w[:, :, :n] = 0
@@ -810,7 +811,8 @@ class WindowsWrapper:
                     if prefix is not None:
                         p_lat, p_mask = self.prefix_window(
                             lat_v[vs], lat_a[..., a0:a1], masks[0].expand(vshape)[vs] if masks is not None else None,
-                            masks[1].expand(ashape)[..., a0:a1] if masks is not None else None, *prefix)
+                            masks[1].expand(ashape)[..., a0:a1] if masks is not None else None, *prefix,
+                            guider.model_patcher.load_device)
                     res = executor(p_noise, p_lat, sampler, sigmas, p_mask, None, disable_pbar, seed, latent_shapes=shapes)
                     rv, ra = comfy.utils.unpack_latents(res, shapes)[:2]
                     rv = rv.float().cpu()
@@ -844,7 +846,7 @@ class WindowsWrapper:
                         p_lat, p_mask = self.prefix_window(
                             lat_v[vs], lat_a[..., a0:a1], masks[0].expand(vshape)[vs] if masks is not None else None,
                             masks[1].expand(ashape)[..., a0:a1] if masks is not None else None,
-                            out_v[:, :, t0:t0 + carry_t].clone(), c_audio, c_a0 - a0)
+                            out_v[:, :, t0:t0 + carry_t].clone(), c_audio, c_a0 - a0, guider.model_patcher.load_device)
                     boxes = [(ys[yi][0], ys[yi][1], xs[xi][0], xs[xi][1]) for yi, xi in tiles]
                     win_v, win_a = self.sample_window_sync(
                         executor, guider, sync_conds, sync_shapes, boxes, [tile_weight(ys, xs, yi, xi) for yi, xi in tiles],

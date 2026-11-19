@@ -14,7 +14,10 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")
 sys.path.insert(0, ROOT)
 import comfy.options
 comfy.options.enable_args_parsing()
-sys.argv = [sys.argv[0], "--cpu"]
+# CPU by default. Set H3_TEST_GPU=1 to run every test on the GPU instead (catches GPU/CPU mix-ups that a
+# CPU-only run cannot see, like the prefix mask bug fixed in 1.6.1).
+GPU = os.environ.get("H3_TEST_GPU") == "1"
+sys.argv = [sys.argv[0]] + ([] if GPU else ["--cpu"])
 import comfy.cli_args  # noqa: E402
 
 import torch  # noqa: E402
