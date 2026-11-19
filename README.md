@@ -19,6 +19,12 @@ The pack also has **Minimax H3 Multi Guide** (many guide frames in one node, see
 
 ## What's new
 
+**1.6.0** — prefix carry in **Long Generation**, and **until_step** in **Multi Guide**
+- **Long Generation** now has the same `carry_mode` as the new V2V node, with **`prefix`** as the default: the previous window's last `carry_prefix_frames` (39 by default) start the next window as frozen frames, for an exact hand-off with no extra tokens. `carry_frames` is the 1.5.0 method.
+- Its settings are reorganized like the new V2V node, and the `carry_overlap` switch is gone (carrying is always on). ⚠️ **Saved Long Generation workflows load with shifted values**: re-add the node, or switch to 1.5.0 in the Manager (*Switch Ver*) to read your old settings, then update. For exactly the 1.5.0 result, use `carry_mode` = `carry_frames` with `carry_prefix_frames` and `overlap_frames` both set to your old `overlap_frames`.
+- **Multi Guide** has a per-guide **`until_step`** (image and audio guides): for how many sampling steps the guide is used. `-1` (default) = every step, as before; `N` = only the first N steps of each run, then it is left out, so it sets the composition and leaves the details free (needs the new optional **model** input and output: route the model through the node, before or after the V2V / Long Generation node); `0` = the guide is switched off without unplugging it. See [Multi Guide node](#multi-guide-node).
+- The V2V nodes are unchanged.
+
 **1.5.0** — a new V2V node with **prefix carry**, and the old one kept as **OLD**
 - **Minimax H3 V2V Temporal Window & Spatial Tiles** is now a new node with tidier settings and a new way to join windows, `carry_mode` = **`prefix`** (the default): the previous window's last frames are put into the start of the next window as frozen frames. They are not generated again, so the hand-off is exact: no crossfade, no ghosting at the join, and no extra tokens (less memory, and faster than the old method in testing). The old method is still there as `carry_mode` = `carry_frames`.
 - The 1.4.0 node is renamed **Minimax H3 V2V Temporal Window & Spatial Tiles OLD**. It is unchanged, so **saved workflows keep their settings and render exactly as before**. For new workflows, use the new node.
@@ -214,6 +220,18 @@ The settings below are the new node's, in the order it shows them. The OLD node 
 - **Audio guides:** connect a soundtrack to `audio_0` and an `audio_1` slot appears, each with its own `audio_frame_idx` (where that audio starts; cropped to the video's remaining duration, like Add Guide). An audio at the same frame as an image guide joins it as one guide, exactly like Add Guide with both an image and an audio connected; an audio at any other frame is an audio-only guide.
 - Works with the V2V and Long Generation nodes: each window gets the guides that fall inside it.
 
+### until_step: release a guide after N steps
+
+Each connected guide also shows an `until_step` (and each audio an `audio_until_step`): for how many sampling steps the guide is used.
+
+- **-1** (default): every step, exactly like Add Guide.
+- **0**: no step: the guide is switched off. Handy to test a run without it, without unplugging the image and losing its slot and `frame_idx`. No model connection needed.
+- **N**: the guide is used for the first N sampling steps only, then left out. The early steps decide the composition (pose, layout, framing); the later steps decide the details (texture, lighting, grain). So the guide sets the frame up and the details are free to blend with the rest of the shot. Count it in your own steps: with an 8-step LoRA, `until_step` 3 holds the guide for steps 1–3; with a 20-step run you would pick a higher number for the same effect.
+- An image and an audio at the same frame are one guide, but each keeps its own `until_step`: for example the picture can be released after step 3 while its sound stays for the whole run.
+- **N needs the model routed through this node** (`model` in → `model` out, on to the sampler or the next model node). The order does not matter: before or after the V2V / Long Generation node gives the same result. If a guide has an `until_step` and the model is not connected, the node stops with a clear message instead of ignoring it.
+- With windows, every window runs its own full schedule, so `until_step` counts within each window. With tiles (including `sync`), every tile follows the same rule.
+- Only guides from this node are released. A V2V window carry is never released.
+
 ## Long Generation node (text / image to video)
 
 **Minimax H3 Long Generation (mo-akkakk)** makes long videos from text, a first frame, or first and last frames — no reference video needed. Like the V2V node, it samples overlapping windows one after another, and each window continues from the previous window's finished frames, so the picture stays sharp and the character stays the same. What it adds is a **timeline**: each window is told only its own part of the story, so the story moves on instead of restarting every window.
@@ -273,10 +291,11 @@ You can also write the timeline H3's own way, `[5s-10s] he stops at the bakery w
 |---|---|
 | `prompt_schedule` | The timeline, one action per line: `5s: text` or `[5s-10s] text`. Empty = a `Timeline:` in the conditioning prompt is used; with none, every window uses the prompt as it is. |
 | `continuous_shot` | On (default): adds "One continuous shot, no cuts." to every window's prompt, so H3 continues the carried frames instead of cutting when the action changes. Turn off if you want cuts. |
-| `window_frames` | Frames per window (17k+5). 124 = 5.2 s. |
-| `overlap_frames` | Frames each window takes over from the previous one (5, 22, 39…). Without a reference video the overlap is what carries the motion forward: 39 recommended. |
+| `window_frames` | Frames per window (17k+5), including the carried frames. 124 = 5.2 s. |
 | `short_final_window` / `min_final_window_frames` | As in the V2V node. |
-| `carry_overlap` | On (default): each window starts from the previous window's finished frames. Keep it on. |
+| `carry_mode` | **`prefix`** (default): the previous window's last `carry_prefix_frames` start the next window as frozen frames (video and audio): kept exactly, not generated again, so the hand-off is exact and no extra tokens are added. **`carry_frames`**: the 1.5.0 method: windows share `overlap_frames`, the next window regenerates them guided by the previous window's last `carry_prefix_frames`, and the two versions are crossfaded. Either way every window continues from the previous one (there is no off switch: without it windows would be unrelated clips). |
+| `carry_prefix_frames` | `prefix`: how many frozen frames start each window after the first (5, 22, 39…); must be less than `window_frames`. Without a reference video these frames are all the next window has to continue the motion from, so 39 (the default) is recommended. `carry_frames`: how many of the overlap frames guide the next window (at or above `overlap_frames` = the whole overlap). |
+| `overlap_frames` | Only shown with `carry_mode` = `carry_frames`: frames each window shares with the previous one (5, 22, 39…), regenerated and crossfaded. 39 recommended. |
 | `first_last_images` | For Image to Video. `own_window` (default): the first image is in the first window's prompt only, the last image in the last window's only — matching where they are used as frames. `all_windows`: every window's prompt shows both (can hold a look, but later windows may drift back toward the first frame). |
 
 There are no tiles in this node: without a reference video, tiles would each draw the whole scene. For a high-resolution result, generate at about 1 MP here, then upscale and refine it with the V2V node, using your generated video as the plate.
@@ -284,7 +303,7 @@ There are no tiles in this node: without a reference video, tiles would each dra
 ### Limits
 
 - When the action changes a lot, or needs a place that is not in the shot yet, H3 may still cut to a new camera angle. Describing every place in the scene and keeping actions small and continuous helps most.
-- At each window join, motion can hesitate for a frame or two where the new window takes over.
+- At each window join, motion can hesitate for a frame or two where the new window takes over. With `prefix`, if the motion changes character right after the frozen frames, try a longer `carry_prefix_frames` (39 → 56).
 - ComfyUI's native **MiniMax H3 Context Windows** node is an alternative: it blends all windows at every step, which avoids hand-off moments but in our side-by-side test gave a noticeably softer picture and a character whose look slowly changed.
 
 ## How it works

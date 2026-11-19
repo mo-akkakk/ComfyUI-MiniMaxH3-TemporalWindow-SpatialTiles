@@ -23,6 +23,7 @@ import safetensors.torch  # noqa: E402
 import comfy.ops  # noqa: E402
 import comfy.sd  # noqa: E402
 import comfy.samplers  # noqa: E402
+import comfy.patcher_extension  # noqa: E402
 import comfy.nested_tensor  # noqa: E402
 import comfy_extras.nodes_minimax_h3 as h3  # noqa: E402
 import nodes  # noqa: E402
@@ -552,7 +553,7 @@ def test_long_generation(model):
     entries = hw.parse_schedule(sched)
     for policy in ("own_window", "all_windows"):
         log = []
-        m, c = pack.MiniMaxH3LongGeneration.execute(model, sched, True, 56, 22, False, 22, True, policy, clip=GenClip(log)).result
+        m, c = pack.MiniMaxH3LongGeneration.execute(model, prompt_schedule=sched, continuous_shot=True, window_frames=56, short_final_window=False, min_final_window_frames=22, carry_mode="carry_frames", carry_prefix_frames=22, overlap_frames=22, first_last_images=policy, clip=GenClip(log)).result
         pos, lat = h3.MiniMaxH3ImageToVideo.execute(c, FakeVAE(), "A snowy street at dusk.", W, H, N, first_frame=first, last_frame=last).result[:2]
         n0 = len(log)
         sigmas = comfy.samplers.calculate_sigmas(m.get_model_object("model_sampling"), "simple", 2)
@@ -577,7 +578,7 @@ def test_long_generation(model):
         if policy == "own_window":
             print("    e.g. window 2 prompt:", repr(enc[1][0]))
     log = []
-    m, c = pack.MiniMaxH3LongGeneration.execute(model, "", False, 56, 22, False, 22, True, "own_window", clip=GenClip(log)).result
+    m, c = pack.MiniMaxH3LongGeneration.execute(model, prompt_schedule="", continuous_shot=False, window_frames=56, short_final_window=False, min_final_window_frames=22, carry_mode="carry_frames", carry_prefix_frames=22, overlap_frames=22, first_last_images="own_window", clip=GenClip(log)).result
     prompt = "Look: snowy dusk.\nTimeline:\n[0s-3s] walks\n[3s-7.3s] stops"
     pos, lat = h3.MiniMaxH3ImageToVideo.execute(c, FakeVAE(), prompt, W, H, N, first_frame=first).result[:2]
     n0 = len(log)
@@ -589,7 +590,7 @@ def test_long_generation(model):
     ok &= enc[1][0] == "Look: snowy dusk.\n\nTimeline:\n" + "\n".join(hw.window_timeline(hw.split_timeline(prompt)[1], f0, f0 + 56 / 24))
     check("long generation without a schedule: a Timeline in the prompt is re-timed per window; the first image only in window 1", ok)
     log = []
-    m, c = pack.MiniMaxH3LongGeneration.execute(model, "", False, 56, 22, False, 22, True, "own_window", clip=GenClip(log)).result
+    m, c = pack.MiniMaxH3LongGeneration.execute(model, prompt_schedule="", continuous_shot=False, window_frames=56, short_final_window=False, min_final_window_frames=22, carry_mode="carry_frames", carry_prefix_frames=22, overlap_frames=22, first_last_images="own_window", clip=GenClip(log)).result
     pos, lat = h3.MiniMaxH3ImageToVideo.execute(c, FakeVAE(), "plain prompt", W, H, N).result[:2]
     n0 = len(log)
     run(m, pos, lat, comfy.samplers.calculate_sigmas(m.get_model_object("model_sampling"), "simple", 2))
@@ -795,6 +796,150 @@ def test_prefix(model):
     check("prefix as long as the window is refused with a clear message", ok)
 
 
+def test_long_generation_prefix(model):
+    W, H, N = 384, 256, 175
+    first, last = torch.full((1, H, W, 3), 0.2), torch.full((1, H, W, 3), 0.8)
+    sched = "0s: walks in\n2s: sits down\n4.5s: looks out"
+    log = []
+    m, c = pack.MiniMaxH3LongGeneration.execute(model, prompt_schedule=sched, continuous_shot=True, window_frames=56, short_final_window=False, min_final_window_frames=22, carry_mode="prefix", carry_prefix_frames=22, overlap_frames=39, first_last_images="own_window", clip=GenClip(log)).result
+    pos, lat = h3.MiniMaxH3ImageToVideo.execute(c, FakeVAE(), "A snowy street at dusk.", W, H, N, first_frame=first,
+                                                last_frame=last).result[:2]
+    n0 = len(log)
+    sigmas = comfy.samplers.calculate_sigmas(m.get_model_object("model_sampling"), "simple", 2)
+    kf_seen = []
+    orig_pc = hw.piece_conds
+
+    def spy(conds, k0, k1, ys_, xs_, *a, **kw):
+        r = orig_pc(conds, k0, k1, ys_, xs_, *a, **kw)
+        kf_seen.append((k0, a[3], [k["resolved_frame_index"] for k in (r["positive"][0].get("minimax_keyframes") or [])]))
+        return r
+    hw.piece_conds = spy
+    try:
+        out, pieces = sample_pieces(m, pos, lat, sigmas)
+    finally:
+        hw.piece_conds = orig_pc
+    lat_t = lat["samples"].unbind()[0].shape[2]
+    windows = hw.plan_windows(lat_t, 56, 22)   # prefix 22 = the windows' overlap; overlap_frames (39) is not used
+    ct = hw.tokens_for_frames(22)
+    total = hw.frames_for_tokens(lat_t)
+    entries = hw.parse_schedule(sched)
+    enc = log[n0:]
+    ok = len(windows) >= 3 and len(pieces) == len(windows) and len(enc) == len(windows) and bool(torch.isfinite(out[0]).all())
+    for k, (t0, tn) in enumerate(windows):
+        p = pieces[k]
+        f0, f1 = hw.frames_for_tokens(t0), hw.frames_for_tokens(t0 + tn)
+        ok &= enc[k][0] == hw.window_prompt("A snowy street at dusk.", hw.window_timeline(entries, f0 / 24, f1 / 24), True)
+        carry, kfs = kf_seen[-len(windows) + k][1], kf_seen[-len(windows) + k][2]
+        ok &= carry is None  # prefix: no guide clip
+        # the first image is a guide only in window 1, the last image only in the last window
+        want = ([0] if k == 0 else []) + ([total - 1 - f0] if k == len(windows) - 1 else [])
+        ok &= sorted(kfs) == sorted(want)
+        if k > 0:
+            # frozen: everything already made (22 frames; more for a last window pulled back to full length)
+            ck = max(a_ + b_ for a_, b_ in windows[:k]) - t0
+            mv, ma = p["mask"][:2]
+            ok &= ck >= ct and bool((mv[:, :, :ck] == 0).all()) and bool((mv[:, :, ck:] == 1).all()) and bool((ma[..., :1] == 0).all())
+            ok &= torch.allclose(p["out"][0][:, :, :ck].float(), p["lat"][0][:, :, :ck].float(), atol=1e-4)
+    check("long generation prefix: {} windows, each after the first starts with the previous window's last 22 "
+          "frames frozen; timelines and first/last images as before".format(len(windows)), bool(ok))
+    try:
+        pack.MiniMaxH3LongGeneration.execute(model, prompt_schedule="", continuous_shot=True, window_frames=56, short_final_window=False, min_final_window_frames=22, carry_mode="prefix", carry_prefix_frames=56, overlap_frames=39, first_last_images="own_window")
+        ok = False
+    except ValueError as e:
+        ok = "carry_prefix_frames" in str(e)
+    check("long generation: a prefix as long as the window is refused with a clear message", ok)
+    m2 = pack.MiniMaxH3LongGeneration.execute(model, prompt_schedule="", continuous_shot=True, window_frames=124, short_final_window=False, min_final_window_frames=22, carry_mode="prefix", carry_prefix_frames=39, overlap_frames=39, first_last_images="own_window").result[0]
+    w = [w_ for w_ in m2.wrappers[comfy.patcher_extension.WrappersMP.OUTER_SAMPLE].values()][0][0]
+    schema = pack.MiniMaxH3LongGeneration.define_schema()
+    names = [i.id for i in schema.inputs]
+    dflt = {i.id: getattr(i, "default", None) for i in schema.inputs}
+    ok = w.carry_mode == "prefix" and w.overlap_frames == 39 and w.carry_overlap
+    ok &= names == ["model", "clip", "prompt_schedule", "continuous_shot", "window_frames", "short_final_window",
+                    "min_final_window_frames", "carry_mode", "carry_prefix_frames", "overlap_frames", "first_last_images"]
+    ok &= dflt["carry_mode"] == "prefix" and dflt["carry_prefix_frames"] == 39
+    check("long generation: settings in the new order, no carry_overlap switch (always on), prefix 39 by default", bool(ok))
+
+
+def test_until(model):
+    hg = importlib.import_module(pack.__name__ + ".h3_guides")
+    a, b = torch.zeros(1, 2, 1, 2, 2), torch.zeros(1, 2, 3)
+    kfs = [{"resolved_frame_index": 0, "latent": a, "audio_latent": b, hg.UNTIL: {"latent": 2, "audio_latent": 0}},
+           {"resolved_frame_index": 5, "latent": a, hg.UNTIL: {"latent": 1, "audio_latent": 0}},
+           {"resolved_frame_index": 9, "latent": a}]
+    k1, ch1 = hg.release(kfs, 1)
+    k2, ch2 = hg.release(kfs, 2)
+    ok = len(hg.release(kfs, 0)[0]) == 3 and not hg.release(kfs, 0)[1]
+    ok &= ch1 and [k["resolved_frame_index"] for k in k1] == [0, 9] and k1[0]["latent"] is not None
+    ok &= ch2 and k2[0]["latent"] is None and k2[0]["audio_latent"] is not None and len(k2) == 2
+    check("until_step release: each part (video / audio) of a guide is left out from its step on", bool(ok))
+
+    W, H, N = 384, 256, 124
+    plate, ref = torch.rand(N, H, W, 3), torch.rand(1, H, W, 3)
+    imgs = [torch.rand(1, H, W, 3), torch.rand(1, H, W, 3)]
+    aud = {"waveform": torch.randn(1, 2, 44100), "sample_rate": 44100}
+
+    def build(order, frames=0):
+        clip = FakeClip()
+        mdl = model
+        if order == "v2v_first":
+            mdl, clip = patch2(mdl, clip, frames=frames, carry_prefix=22)
+        elif order == "mg_first":
+            clip = patch2(model, clip, frames=frames, carry_prefix=22)[1]  # the CLIP routed through the V2V node
+        pos, lat = conditioning(clip, plate, ref, W, H, N, guide=False)
+        pos, mdl = pack.MiniMaxH3MultiGuide.execute(
+            pos, lat, model=mdl, vae=FakeVAE(), audio_vae=FakeAudioVAE(), guides={"guide_0": imgs[0], "guide_1": imgs[1]},
+            audios={"audio_0": aud}, frame_idx_0=0, frame_idx_1=40, until_step_0=1, until_step_1=-1,
+            audio_frame_idx_0=0, audio_until_step_0=2).result
+        if order == "mg_first":
+            mdl = patch2(mdl, clip, frames=frames, carry_prefix=22)[0]
+        return mdl, pos, lat
+
+    seen = []
+
+    def spy(executor, *args, **kwargs):
+        pl = kwargs.get("minimax_payload") or {}
+        seen.append([(k["resolved_frame_index"], k.get("latent") is not None, k.get("audio_latent") is not None)
+                     for k in pl.get("keyframes") or []])
+        return executor(*args, **kwargs)
+
+    outs = {}
+    for order, frames in (("alone", 0), ("mg_first", 56), ("v2v_first", 56)):
+        mdl, pos, lat = build(order, frames)
+        mdl = mdl.clone()
+        mdl.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "test_spy", spy)
+        seen.clear()
+        sigmas = comfy.samplers.calculate_sigmas(mdl.get_model_object("model_sampling"), "simple", 3)
+        outs[order] = run(mdl, pos, lat, sigmas)[0]["samples"].unbind()[0]
+        outs[order + "_seen"] = list(seen)
+    s0 = outs["alone_seen"]
+    ok = len(s0) == 3 and s0[0] == [(0, True, True), (40, True, False)]
+    ok &= s0[1] == [(0, False, True), (40, True, False)] and s0[2] == [(40, True, False)]
+    check("until_step (Multi Guide alone, 3 steps): guide_0 for step 1, its audio for steps 1-2, guide_1 the whole run", bool(ok))
+    sw = outs["mg_first_seen"]
+    ok = len(sw) >= 6 and sw[0][:1] == [(0, True, True)] and sw[1][:1] == [(0, False, True)]
+    check("until_step with windows: guide_0 (frame 0, window 1) is released after its step", bool(ok))
+    check("until_step works the same with Multi Guide before or after the V2V node (same result, same released guides)",
+          torch.equal(outs["mg_first"], outs["v2v_first"]) and outs["mg_first_seen"] == outs["v2v_first_seen"]
+          and bool(torch.isfinite(outs["mg_first"]).all()))
+    pos, lat = conditioning(FakeClip(), plate, ref, W, H, N, guide=False)
+    try:
+        pack.MiniMaxH3MultiGuide.execute(pos, lat, vae=FakeVAE(), guides={"guide_0": imgs[0]}, frame_idx_0=0, until_step_0=2)
+        ok = False
+    except ValueError as e:
+        ok = "guide_0" in str(e) and "model" in str(e)
+    p_all, m_out = pack.MiniMaxH3MultiGuide.execute(pos, lat, vae=FakeVAE(), guides={"guide_0": imgs[0]}, frame_idx_0=0).result
+    check("until_step without the model connected is refused; with the default -1 the node works without a model",
+          ok and m_out is None and len(p_all[0][1]["minimax_keyframes"]) == 1 and hg.UNTIL not in p_all[0][1]["minimax_keyframes"][0])
+    # 0 = switched off: that guide is left out (no model needed); the others stay
+    p0 = pack.MiniMaxH3MultiGuide.execute(pos, lat, vae=FakeVAE(), audio_vae=FakeAudioVAE(),
+                                          guides={"guide_0": imgs[0], "guide_1": imgs[1]}, audios={"audio_0": aud},
+                                          frame_idx_0=0, frame_idx_1=40, until_step_0=0, audio_frame_idx_0=0).result[0]
+    k0 = p0[0][1]["minimax_keyframes"]
+    check("until_step 0 switches a guide off: guide_0 left out, its audio at the same frame kept as an audio-only guide",
+          [(k["resolved_frame_index"], k.get("latent") is not None, k.get("audio_latent") is not None) for k in k0]
+          == [(40, True, False), (0, False, True)])
+
+
 if __name__ == "__main__":
 
 
@@ -819,6 +964,8 @@ if __name__ == "__main__":
         test_tile_sync(model)
         test_multi_guide(model)
         test_prefix(model)
+        test_long_generation_prefix(model)
+        test_until(model)
         test_full_res_plate(model)
         test_long_generation(model)
     print("\n{} failure(s)".format(len(FAILS)))

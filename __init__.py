@@ -1,5 +1,6 @@
 from comfy_api.latest import ComfyExtension, io
 
+from .h3_guides import apply_until, keyframe_counts, tag_new_keyframes
 from .h3_windows import WindowsWrapper, apply, parse_schedule, recording_clip
 
 
@@ -132,16 +133,28 @@ class MiniMaxH3LongGeneration(io.ComfyNode):
                                          "frames instead of cutting to a new shot when the action changes. Turn off if you want cuts."),
                 io.Int.Input("window_frames", default=124, min=22, max=3600, step=17,
                              tooltip="Frames per window (17k+5). 124 = 5.2 s. Keep it inside what works natively for you."),
-                io.Int.Input("overlap_frames", default=39, min=5, max=1000, step=17,
-                             tooltip="Frames shared by neighbouring windows (5, 22, 39...). Without a reference video the overlap is "
-                                     "what carries the motion forward, so use more than for V2V (39 recommended)."),
                 io.Boolean.Input("short_final_window", default=False,
                                  tooltip="Let the last window be shorter than window_frames instead of pulling it back to full length."),
                 io.Int.Input("min_final_window_frames", default=22, min=5, max=3600, step=17,
                              tooltip="With short_final_window on: the last window is never shorter than this (17k+5: 5, 22, 39, 56...)."),
-                io.Boolean.Input("carry_overlap", default=True,
-                                 tooltip="Each window starts from the previous window's finished overlap frames (video and audio). "
-                                         "Keep it on: without it, windows are unrelated clips."),
+                io.Combo.Input("carry_mode", options=["prefix", "carry_frames"], default="prefix",
+                               tooltip="How each window continues from the previous one. "
+                                       "prefix (default): the previous window's last carry_prefix_frames are put into the start "
+                                       "of the next window as frozen frames. They are not generated again, so the hand-off is "
+                                       "exact (no crossfade) and they add no extra tokens. "
+                                       "carry_frames: the 1.5.0 method. Windows overlap by overlap_frames, the next window "
+                                       "regenerates the overlap guided by the previous window's last carry_prefix_frames "
+                                       "(extra tokens), and the two versions are crossfaded."),
+                io.Int.Input("carry_prefix_frames", default=39, min=5, max=1000, step=17,
+                             tooltip="prefix: how many frames of the previous window start the next one, frozen (5, 22, 39...). "
+                                     "Without a reference video these frames are what the next window continues the motion "
+                                     "from, so 39 is recommended. Must be less than window_frames. "
+                                     "carry_frames: how many of the overlap frames guide the next window (at or above "
+                                     "overlap_frames = the whole overlap)."),
+                io.Int.Input("overlap_frames", default=39, min=5, max=1000, step=17,
+                             tooltip="carry_mode = carry_frames only: frames shared by neighbouring windows (5, 22, 39...). "
+                                     "Without a reference video the overlap is what carries the motion forward, so use more than "
+                                     "for V2V (39 recommended)."),
                 io.Combo.Input("first_last_images", options=["own_window", "all_windows"], default="own_window",
                                tooltip="Image to Video's first/last frame images in the prompt. own_window: the first image is only in the "
                                        "first window's prompt and the last image only in the last window's (matches where they are "
@@ -152,12 +165,20 @@ class MiniMaxH3LongGeneration(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, prompt_schedule, continuous_shot, window_frames, overlap_frames, short_final_window,
-                min_final_window_frames, carry_overlap, first_last_images="own_window", clip=None) -> io.NodeOutput:
-        wrapper = WindowsWrapper(window_frames, overlap_frames, carry_overlap, 0, 0, 0, False,
+    def execute(cls, model, prompt_schedule, continuous_shot, window_frames, short_final_window, min_final_window_frames,
+                carry_mode, carry_prefix_frames, overlap_frames, first_last_images="own_window", clip=None) -> io.NodeOutput:
+        if carry_mode == "prefix":
+            if carry_prefix_frames >= window_frames:
+                raise ValueError("Minimax H3 Long Generation: carry_prefix_frames ({}) must be less than window_frames ({}), "
+                                 "so each window has new frames to make.".format(carry_prefix_frames, window_frames))
+            overlap, carry, mode = carry_prefix_frames, 0, "prefix"
+        else:
+            overlap, mode = overlap_frames, "guide"
+            carry = carry_prefix_frames if carry_prefix_frames < overlap_frames else 0
+        wrapper = WindowsWrapper(window_frames, overlap, True, 0, 0, 0, False,
                                  min_final_window_frames if short_final_window else 0,
                                  schedule=parse_schedule(prompt_schedule), image_policy=first_last_images,
-                                 continuous=continuous_shot)
+                                 continuous=continuous_shot, carry_frames=carry, carry_mode=mode)
         return io.NodeOutput(apply(model, wrapper), recording_clip(clip, record_all=True) if clip is not None else None)
 
 
@@ -175,8 +196,15 @@ class MiniMaxH3MultiGuide(io.ComfyNode):
             description="Add Guide for MiniMax H3, for many guides in one node. Connect an image (or a clip) to guide_0 and a new "
                         "guide slot appears, each with its own frame_idx; audio guides work the same way with audio_frame_idx. "
                         "Each guide is anchored exactly like the native Add Guide node (an image and an audio at the same frame "
-                        "become one guide, as in Add Guide), so this is the same as chaining one Add Guide per guide.",
+                        "become one guide, as in Add Guide), so this is the same as chaining one Add Guide per guide. "
+                        "until_step: -1 = the guide is used for every step (default), N = only for the first N sampling "
+                        "steps (it sets the composition, then the details are free; needs the model routed through this "
+                        "node), 0 = the guide is switched off.",
             inputs=[
+                io.Model.Input("model", optional=True,
+                               tooltip="Only needed when a guide has an until_step of 1 or more: route the model through here "
+                                       "(before or after the V2V / Long Generation node, either works) so the guide can be "
+                                       "released after that step."),
                 io.Conditioning.Input("positive"),
                 io.Latent.Input("latent", tooltip="The MiniMax H3 AV latent (from Reference to Video, Image to Video...)."),
                 io.Vae.Input("vae", optional=True, tooltip="Video VAE, needed when an image guide is connected."),
@@ -201,41 +229,68 @@ class MiniMaxH3MultiGuide(io.ComfyNode):
                              tooltip="Frame to start audio_{} at. Negative values count from the end of the video. Same frame as "
                                      "an image guide = one guide with both, like Add Guide with image and audio.".format(i))
                 for i in range(MAX_GUIDES)
+            ] + [
+                io.Int.Input("until_step_{}".format(i), default=-1, min=-1, max=1000,
+                             tooltip="For how many sampling steps guide_{} is used. -1 = every step (like Add Guide). "
+                                     "N = only the first N steps of each run (each window has its own run), then it is left "
+                                     "out: it sets the composition early and leaves the details free; needs the model routed "
+                                     "through this node. 0 = never: the guide is switched off.".format(i))
+                for i in range(MAX_GUIDES)
+            ] + [
+                io.Int.Input("audio_until_step_{}".format(i), default=-1, min=-1, max=1000,
+                             tooltip="For how many sampling steps audio_{} is used. -1 = every step. N = only the first N "
+                                     "steps of each run (needs the model routed through this node). 0 = never: the audio is "
+                                     "switched off.".format(i))
+                for i in range(MAX_GUIDES)
             ],
-            outputs=[io.Conditioning.Output(display_name="positive")],
+            outputs=[io.Conditioning.Output(display_name="positive"), io.Model.Output(display_name="model")],
         )
 
     @classmethod
-    def execute(cls, positive, latent, vae=None, audio_vae=None, guides=None, audios=None, **idx) -> io.NodeOutput:
+    def execute(cls, positive, latent, model=None, vae=None, audio_vae=None, guides=None, audios=None, **idx) -> io.NodeOutput:
         from comfy_extras.nodes_minimax_h3 import FRAME_PER_TOKEN, MiniMaxH3AddGuide
         video = latent["samples"].tensors[0] if getattr(latent["samples"], "is_nested", False) else None
         frame_count = sum(FRAME_PER_TOKEN[k % 5] for k in range(video.shape[2])) if video is not None else 0
         resolve = lambda f: f if f >= 0 else frame_count + f
-        images = [("guide_{}".format(i), idx.get("frame_idx_{}".format(i), 0), (guides or {}).get("guide_{}".format(i)))
-                  for i in range(MAX_GUIDES)]
-        sounds = [("audio_{}".format(i), idx.get("audio_frame_idx_{}".format(i), 0), (audios or {}).get("audio_{}".format(i)))
-                  for i in range(MAX_GUIDES)]
+        images = [("guide_{}".format(i), idx.get("frame_idx_{}".format(i), 0), (guides or {}).get("guide_{}".format(i)),
+                   idx.get("until_step_{}".format(i), -1)) for i in range(MAX_GUIDES)]
+        sounds = [("audio_{}".format(i), idx.get("audio_frame_idx_{}".format(i), 0), (audios or {}).get("audio_{}".format(i)),
+                   idx.get("audio_until_step_{}".format(i), -1)) for i in range(MAX_GUIDES)]
         images = [g for g in images if g[2] is not None]
         sounds = [a for a in sounds if a[2] is not None]
         if not images and not sounds:
             raise ValueError("Minimax H3 Multi Guide: connect an image to guide_0 (or an audio to audio_0)")
+        # until_step 0 = switched off: the guide is left out entirely (it keeps its slot and frame_idx)
+        images = [g for g in images if g[3] != 0]
+        sounds = [a for a in sounds if a[3] != 0]
+        if model is None:
+            used = [g[0] for g in images + sounds if g[3] > 0]
+            if used:
+                raise ValueError("Minimax H3 Multi Guide: {} has an until_step, which needs the model routed through this node "
+                                 "(model in -> model out). Connect it, or set until_step to -1 (every step).".format(", ".join(used)))
         jobs = []
-        for name, f, image in images:
+        for name, f, image, until in images:
             # an audio guide at the same frame joins this image, like Add Guide with both inputs
             match = next((a for a in sounds if resolve(a[1]) == resolve(f)), None)
             if match is not None:
                 sounds.remove(match)
-                jobs.append((name + " + " + match[0], f, image, match[2]))
+                jobs.append((name + " + " + match[0], f, image, match[2], until, match[3]))
             else:
-                jobs.append((name, f, image, None))
-        jobs += [(name, f, None, audio) for name, f, audio in sounds]
-        for name, f, image, audio in jobs:
+                jobs.append((name, f, image, None, until, -1))
+        jobs += [(name, f, None, audio, -1, until) for name, f, audio, until in sounds]
+        for name, f, image, audio, v_until, a_until in jobs:
+            before = keyframe_counts(positive)
             try:
                 positive = MiniMaxH3AddGuide.execute(positive=positive, latent=latent, frame_idx=f, vae=vae,
                                                      audio_vae=audio_vae, image=image, audio=audio).args[0]
             except ValueError as e:
                 raise ValueError("Minimax H3 Multi Guide, {}: {}".format(name, e)) from e
-        return io.NodeOutput(positive)
+            # tags hold the step count to release at; -1 (every step) is stored as 0 = never released
+            positive = tag_new_keyframes(positive, before, max(v_until, 0) if image is not None else 0,
+                                         max(a_until, 0) if audio is not None else 0)
+        if model is not None:
+            model = apply_until(model)
+        return io.NodeOutput(positive, model)
 
 
 class MiniMaxH3V2V(io.ComfyNode):

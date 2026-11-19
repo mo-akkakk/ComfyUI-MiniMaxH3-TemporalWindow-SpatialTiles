@@ -1,4 +1,4 @@
-// Minimax H3 V2V nodes (mo-akkakk): show only the settings that belong to the chosen option.
+// Minimax H3 V2V and Long Generation nodes (mo-akkakk): show only the settings that belong to the chosen option.
 //   tile_mode:  tile_size  -> tile_width / tile_height       tile_count -> tiles_across / tiles_down
 //   carry_mode: carry_frames -> overlap_frames               prefix     -> (nothing extra)
 // Widgets are only hidden, never removed or reordered, so saved workflows keep their values.
@@ -16,6 +16,7 @@ const CARRY_MODE = {
 const RULES = {
     MiniMaxH3TemporalWindow: { tile_mode: TILE_MODE },
     MiniMaxH3V2V: { tile_mode: TILE_MODE, carry_mode: CARRY_MODE },
+    MiniMaxH3LongGeneration: { carry_mode: CARRY_MODE },
 };
 
 function setup(node, rules) {

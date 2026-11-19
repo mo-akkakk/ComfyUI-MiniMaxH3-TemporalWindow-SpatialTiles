@@ -1,20 +1,23 @@
-// Minimax H3 Multi Guide (mo-akkakk): one frame index per guide.
-// - frame_idx_N is shown when guide_N is connected (frame_idx_0 always); audio_frame_idx_N when audio_N is connected.
-// - Each frame index belongs to its connection: when a guide is disconnected, ComfyUI moves the guides below it
-//   up one slot, and their frame indexes move up with them.
+// Minimax H3 Multi Guide (mo-akkakk): one frame index and one until_step per guide.
+// - frame_idx_N / until_step_N are shown when guide_N is connected (guide_0's always);
+//   audio_frame_idx_N / audio_until_step_N when audio_N is connected.
+// - These settings belong to their connection: when a guide is disconnected, ComfyUI moves the guides below it
+//   up one slot, and their settings move up with them.
 // Widgets are only hidden, never removed or reordered, so saved workflows keep their values.
 import { app } from "../../scripts/app.js";
 
 const NODE = "MiniMaxH3MultiGuide";
 const GROUPS = [
-    { slot: /^(?:guides\.)?guide_(\d+)$/, widget: (i) => `frame_idx_${i}`, wre: /^frame_idx_(\d+)$/, always: 0 },
-    { slot: /^(?:audios\.)?audio_(\d+)$/, widget: (i) => `audio_frame_idx_${i}`, wre: /^audio_frame_idx_(\d+)$/, always: -1 },
+    { slot: /^(?:guides\.)?guide_(\d+)$/, widgets: (i) => [`frame_idx_${i}`, `until_step_${i}`],
+      wre: /^(?:frame_idx|until_step)_(\d+)$/, always: 0 },
+    { slot: /^(?:audios\.)?audio_(\d+)$/, widgets: (i) => [`audio_frame_idx_${i}`, `audio_until_step_${i}`],
+      wre: /^audio_(?:frame_idx|until_step)_(\d+)$/, always: -1 },
 ];
 
 function setup(node) {
     if (node.__h3MultiGuideUi) return;
     node.__h3MultiGuideUi = true;
-    const byLink = new Map(); // link id -> frame index of the guide on that link
+    const byLink = new Map(); // link id -> [frame index, until step] of the guide on that link
 
     const find = (name) => node.widgets?.find((w) => w.name === name);
     const links = (g) => {
@@ -30,8 +33,7 @@ function setup(node) {
         for (const g of GROUPS) {
             for (const [i, l] of links(g)) {
                 live.add(l);
-                const w = find(g.widget(i));
-                if (w) byLink.set(l, w.value);
+                byLink.set(l, g.widgets(i).map((name) => find(name)?.value));
             }
         }
         for (const l of [...byLink.keys()]) if (!live.has(l)) byLink.delete(l);
@@ -42,9 +44,13 @@ function setup(node) {
         GROUPS.forEach((g, k) => {
             for (const [i, l] of links(g)) {
                 used[k].add(i);
-                // a guide that moved to another slot brings its frame index along
-                const w = find(g.widget(i));
-                if (w && byLink.has(l) && w.value !== byLink.get(l)) w.value = byLink.get(l);
+                // a guide that moved to another slot brings its settings along
+                if (!byLink.has(l)) continue;
+                g.widgets(i).forEach((name, k) => {
+                    const w = find(name);
+                    const v = byLink.get(l)[k];
+                    if (w && v !== undefined && w.value !== v) w.value = v;
+                });
             }
         });
         remember();
