@@ -4,6 +4,10 @@
 
 by Mohamed ([mo-akkakk](https://registry.comfy.org/publishers/mo-akkakk))
 
+[![Watch the updated tutorial on YouTube](https://img.youtube.com/vi/eMlx5tz02q8/hqdefault.jpg)](https://www.youtube.com/watch?v=eMlx5tz02q8)
+
+▶ [Watch the updated tutorial on YouTube](https://www.youtube.com/watch?v=eMlx5tz02q8)
+
 [![Watch the video on YouTube](https://img.youtube.com/vi/_lVzzLr9aC4/hqdefault.jpg)](https://www.youtube.com/watch?v=_lVzzLr9aC4)
 
 ▶ [Watch the video on YouTube](https://www.youtube.com/watch?v=_lVzzLr9aC4)
