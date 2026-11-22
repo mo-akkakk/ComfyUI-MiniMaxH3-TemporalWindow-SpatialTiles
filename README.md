@@ -4,9 +4,9 @@
 
 by Mohamed ([mo-akkakk](https://registry.comfy.org/publishers/mo-akkakk))
 
-[![Watch the updated tutorial on YouTube](https://img.youtube.com/vi/eMlx5tz02q8/hqdefault.jpg)](https://www.youtube.com/watch?v=eMlx5tz02q8)
+[![MiniMax H3 Temporal Windows & Spatial Tiles Custom node Explained + latest update 1.6.1](https://img.youtube.com/vi/eMlx5tz02q8/hqdefault.jpg)](https://www.youtube.com/watch?v=eMlx5tz02q8)
 
-▶ [Watch the updated tutorial on YouTube](https://www.youtube.com/watch?v=eMlx5tz02q8)
+▶ [MiniMax H3 Temporal Windows & Spatial Tiles Custom node Explained + latest update 1.6.1](https://www.youtube.com/watch?v=eMlx5tz02q8)
 
 [![Watch the video on YouTube](https://img.youtube.com/vi/_lVzzLr9aC4/hqdefault.jpg)](https://www.youtube.com/watch?v=_lVzzLr9aC4)
 
@@ -130,10 +130,14 @@ In the `example_workflows` folder (also listed in ComfyUI under **Workflow → B
 
 | Workflow | What it does |
 |---|---|
-| `Minimax-H3_Video_Editing_1STG.json` | Stage 1: video editing / restyling with Reference to Video, run through the V2V node. |
+| `Minimax-H3_Video_Editing_1STG.json` | Stage 1: video editing / restyling with Reference to Video, run through the V2V node, with guides from the Multi Guide node. |
+| `Minimax-H3_Video_Editing_1STG_2Batchs.json` | The same stage-1 editing, with the shot processed in two batches (Batch 01 and Batch 02), each with its own inputs, conditioning and sampling. |
+| `Minimax-H3_Video_Editing_Ripple.json` | Edit propagation with the [H3 Ripple LoRA](https://huggingface.co/WepeNerd/H3_Ripple/tree/main): the source video goes in as a guide first, then the edited reference images. Keep the workflow's prompt; only add to it if the result drifts from the intended style. |
+| `MiniMax_H3_Inpainting_1STG.json` | Stage 1 inpainting: only a masked area of the video is regenerated. |
+| `MiniMax_H3_Inpainting_cropping_1STG.json` | Stage 1 inpainting on a crop: the masked area is cropped out and generated on its own, then placed back into the video. |
 | `Minimax-H3_latent_upscaler.json` | Stage 2: latent upscale of the stage-1 result, then a refine pass through the V2V node. |
 
-They use a few other node packs; ComfyUI Manager's **Install Missing Custom Nodes** finds them: KJNodes, Video Helper Suite, rgthree, Easy Use, RES4LYF, Nuke Nodes, ComfyUI-Open-H3-Regenerate, Comfyui_DualVideoCompare, Comfyui-MMH3-UltimateUpscale, ReservedVRAM and fearnworks nodes. The latent upscaler model comes from [LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler) (a note in the workflow links it).
+They use a few other node packs; ComfyUI Manager's **Install Missing Custom Nodes** finds them: KJNodes, Video Helper Suite, rgthree, Easy Use, RES4LYF, Nuke Nodes, MTB (comfy-mtb), MaskVidExperiments, ComfyUI-Open-H3-Regenerate, Comfyui_DualVideoCompare, Comfyui-MMH3-UltimateUpscale, ReservedVRAM and fearnworks nodes. The latent upscaler model comes from [LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler) (a note in the workflow links it).
 
 ## Wiring
 
