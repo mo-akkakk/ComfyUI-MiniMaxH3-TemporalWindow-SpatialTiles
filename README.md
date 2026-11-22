@@ -8,9 +8,9 @@ by Mohamed ([mo-akkakk](https://registry.comfy.org/publishers/mo-akkakk))
 
 ▶ [MiniMax H3 Temporal Windows & Spatial Tiles Custom node Explained + latest update 1.6.1](https://www.youtube.com/watch?v=eMlx5tz02q8)
 
-[![Watch the video on YouTube](https://img.youtube.com/vi/_lVzzLr9aC4/hqdefault.jpg)](https://www.youtube.com/watch?v=_lVzzLr9aC4)
+[![MiniMax H3 V2V Masterclass](https://img.youtube.com/vi/_lVzzLr9aC4/hqdefault.jpg)](https://www.youtube.com/watch?v=_lVzzLr9aC4)
 
-▶ [Watch the video on YouTube](https://www.youtube.com/watch?v=_lVzzLr9aC4)
+▶ [MiniMax H3 V2V Masterclass](https://www.youtube.com/watch?v=_lVzzLr9aC4)
 
 Long and high-resolution video-to-video for the **open-weights MiniMax H3** in native ComfyUI. It is one node that goes after the model:
 
