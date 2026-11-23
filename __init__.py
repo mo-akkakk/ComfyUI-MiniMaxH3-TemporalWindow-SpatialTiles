@@ -1,6 +1,9 @@
 from comfy_api.latest import ComfyExtension, io
 
+import logging
+
 from .h3_guides import apply_until, keyframe_counts, tag_new_keyframes
+from .h3_refs import BigVideoVAE, set_video_block_sizes
 from .h3_windows import WindowsWrapper, apply, parse_schedule, recording_clip
 
 
@@ -403,9 +406,50 @@ class MiniMaxH3V2V(io.ComfyNode):
         return io.NodeOutput(apply(model, wrapper), recording_clip(clip) if clip is not None else None)
 
 
+class MiniMaxH3ReferenceToVideoHiRes(io.ComfyNode):
+    """The native MiniMax H3 Reference to Video, plus ref_video_size: 'match' gives the DiT the reference
+    videos at the generation's size instead of the native ~1 MP canvas."""
+
+    @classmethod
+    def define_schema(cls):
+        from comfy_extras.nodes_minimax_h3 import MiniMaxH3ReferenceToVideo
+        schema = MiniMaxH3ReferenceToVideo.define_schema()
+        schema.node_id = "MiniMaxH3ReferenceToVideoHiRes"
+        schema.display_name = "Minimax H3 Reference to Video HiRes (mo-akkakk)"
+        schema.description = ("MiniMax H3 Reference to Video with one extra setting, ref_video_size. native = exactly the "
+                              "native node (reference videos at a 768-short-edge canvas, about 1 MP). match = above that, "
+                              "the reference videos are given to the model at the generation's pixel area (keeping their "
+                              "aspect, never upscaled), for more detail at 2 MP and up. The text encoder sees them as "
+                              "in the native node either way.")
+        at = next(k for k, i in enumerate(schema.inputs) if i.id == "ref_image_size") + 1
+        schema.inputs.insert(at, io.Combo.Input(
+            "ref_video_size", options=["native", "match"], default="native",
+            tooltip="native: reference videos at the native ~1 MP canvas (768 short edge), as in MiniMax H3 Reference to "
+                    "Video. match: when the generation is larger, each reference video is given to the model at the "
+                    "generation's pixel area instead (keeping its aspect, never upscaled beyond the source). More detail "
+                    "to follow at 2 MP and up, but more reference tokens (slower, more memory) and larger than the size "
+                    "H3's reference pipeline uses. Needs vae."))
+        return schema
+
+    @classmethod
+    def execute(cls, ref_video_size="native", **kwargs) -> io.NodeOutput:
+        from comfy_extras.nodes_minimax_h3 import MiniMaxH3ReferenceToVideo
+        videos = [v for v in (kwargs.get("ref_videos") or {}).values() if v is not None]
+        if ref_video_size != "match" or kwargs.get("vae") is None or not videos:
+            return io.NodeOutput(*MiniMaxH3ReferenceToVideo.execute(**kwargs).args[:2])
+        # one encode per video, straight at the larger size: the native node encodes through a stand-in VAE
+        stand_in = BigVideoVAE(kwargs["vae"], videos, kwargs["width"], kwargs["height"])
+        cond, latent = MiniMaxH3ReferenceToVideo.execute(**dict(kwargs, vae=stand_in)).args[:2]
+        cond = set_video_block_sizes(cond, stand_in.sizes)
+        for k, (w, h) in enumerate(stand_in.sizes):
+            logging.info("Minimax H3 Reference to Video HiRes: reference video {} given to the model at {}x{}".format(k + 1, w, h))
+        return io.NodeOutput(cond, latent)
+
+
 class MiniMaxH3WindowExtension(ComfyExtension):
     async def get_node_list(self):
-        return [MiniMaxH3TemporalWindow, MiniMaxH3LongGeneration, MiniMaxH3MultiGuide, MiniMaxH3V2V]
+        return [MiniMaxH3TemporalWindow, MiniMaxH3LongGeneration, MiniMaxH3MultiGuide, MiniMaxH3V2V,
+                MiniMaxH3ReferenceToVideoHiRes]
 
 
 WEB_DIRECTORY = "./js"  # tile_mode_ui.js: chosen tile_mode's settings only; multi_guide_ui.js: one frame_idx per guide

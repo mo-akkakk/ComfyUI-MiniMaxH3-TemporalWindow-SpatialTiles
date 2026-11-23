@@ -943,6 +943,55 @@ def test_until(model):
           == [(40, True, False), (0, False, True)])
 
 
+def test_ref_hires(model):
+    W0, H0, N = 1536, 864, 22
+    vid = torch.rand(N, H0, W0, 3)
+    ref = torch.rand(1, 512, 512, 3)
+    args = dict(prompt="<Video 1> restyled.", length=N, ref_image_size="match", ref_images={"ref_image_0": ref},
+                ref_videos={"ref_video_0": vid}, vae=FakeVAE())
+
+    def blocks(cond):
+        return [(b["kind"], b.get("latent_w"), b.get("latent_h"), tuple(b["latent"].shape)) for b in cond[0][1]["minimax_refs"]]
+    nat = h3.MiniMaxH3ReferenceToVideo.execute(clip=FakeClip(), width=1536, height=864, **args).result
+    same = pack.MiniMaxH3ReferenceToVideoHiRes.execute(clip=FakeClip(), width=1536, height=864, ref_video_size="native", **args).result
+    big = pack.MiniMaxH3ReferenceToVideoHiRes.execute(clip=FakeClip(), width=1536, height=864, ref_video_size="match", **args).result
+    ok = blocks(nat[0]) == blocks(same[0]) and torch.equal(nat[0][0][0], same[0][0][0])
+    bn, bb = blocks(nat[0]), blocks(big[0])
+    vi = [k for k, b in enumerate(bn) if b[0].startswith("video")][0]
+    ok &= bn[vi][1:3] != bb[vi][1:3] and (bb[vi][1], bb[vi][2]) == (96, 54) and bb[vi][3][2] == bn[vi][3][2]
+    ok &= [b for k, b in enumerate(bn) if k != vi] == [b for k, b in enumerate(bb) if k != vi]   # pictures untouched
+    ok &= torch.equal(nat[0][0][0], big[0][0][0]) and torch.equal(nat[1]["samples"].unbind()[0], big[1]["samples"].unbind()[0])
+    check("Reference to Video HiRes: native = the native node; match at 1536x864 gives the model the video at "
+          "1536x864 ({}x{} native), same frames, same text encoding, pictures untouched".format(bn[vi][1] * 16, bn[vi][2] * 16), bool(ok))
+    small = pack.MiniMaxH3ReferenceToVideoHiRes.execute(clip=FakeClip(), width=960, height=544, ref_video_size="match", **args).result
+    nat_s = h3.MiniMaxH3ReferenceToVideo.execute(clip=FakeClip(), width=960, height=544, **args).result
+    lowres = dict(args, ref_videos={"ref_video_0": torch.rand(N, 360, 640, 3)})
+    up = pack.MiniMaxH3ReferenceToVideoHiRes.execute(clip=FakeClip(), width=1536, height=864, ref_video_size="match", **lowres).result
+    nat_l = h3.MiniMaxH3ReferenceToVideo.execute(clip=FakeClip(), width=1536, height=864, **lowres).result
+    check("Reference to Video HiRes match: below ~1 MP, and for a source smaller than the canvas, it equals native (never upscales)",
+          blocks(small[0]) == blocks(nat_s[0]) and blocks(up[0]) == blocks(nat_l[0]))
+    # it runs through the V2V node with windows and sync tiles
+    m, c = patch2(model, FakeClip(), frames=39, tiles=True, tw=768, th=448, tov=128, tile_carry="sync")
+    pos, lat = pack.MiniMaxH3ReferenceToVideoHiRes.execute(clip=c, width=1536, height=864, ref_video_size="match",
+                                                            **dict(args, ref_videos={"ref_video_0": torch.rand(56, 864, 1536, 3)},
+                                                                   length=56)).result
+    ok = pos[0][1]["minimax_refs"][1]["latent_w"] == 96
+    sigmas = comfy.samplers.calculate_sigmas(m.get_model_object("model_sampling"), "simple", 2)
+    out = run(m, pos, lat, sigmas)[0]["samples"].unbind()[0]
+    check("Reference to Video HiRes refs (1536x864) run through the V2V node (windows + sync tiles)", ok and bool(torch.isfinite(out).all()))
+    # one encode per video, at the large size (no second, native-size video encode)
+    calls = []
+
+    class CountVAE(FakeVAE):
+        def encode(self, frames):
+            calls.append(tuple(frames.shape[:3]))
+            return FakeVAE.encode(self, frames)
+    pack.MiniMaxH3ReferenceToVideoHiRes.execute(clip=FakeClip(), width=1536, height=864, ref_video_size="match",
+                                                **dict(args, vae=CountVAE()))
+    check("Reference to Video HiRes encodes each video once, directly at the larger size",
+          sorted(calls) == sorted([(1, 512, 512), (N, 864, 1536)]))
+
+
 if __name__ == "__main__":
 
 
@@ -969,6 +1018,7 @@ if __name__ == "__main__":
         test_prefix(model)
         test_long_generation_prefix(model)
         test_until(model)
+        test_ref_hires(model)
         test_full_res_plate(model)
         test_long_generation(model)
     print("\n{} failure(s)".format(len(FAILS)))

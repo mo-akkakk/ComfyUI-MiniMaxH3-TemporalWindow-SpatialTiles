@@ -19,9 +19,12 @@ Long and high-resolution video-to-video for the **open-weights MiniMax H3** in n
 
 Both work in stage 1 (full denoise) and stage 2 (low-denoise refine).
 
-The pack also has **Minimax H3 Multi Guide** (many guide frames in one node, see [Multi Guide node](#multi-guide-node)), **Minimax H3 V2V Temporal Window & Spatial Tiles OLD** (the 1.4.0 V2V node, kept for saved workflows), and **Minimax H3 Long Generation**, for long text-to-video and image-to-video without a reference video, with a prompt timeline so the story moves forward. See [Long Generation node](#long-generation-node-text--image-to-video). Nothing inside the model is patched: every window and tile is an ordinary native H3 run. With one window and no tiles, the output is bit-identical to the plain native workflow.
+The pack also has **Minimax H3 Reference to Video HiRes** (the native Reference to Video with full-size reference videos above 1 MP, see [Reference to Video HiRes node](#reference-to-video-hires-node)), **Minimax H3 Multi Guide** (many guide frames in one node, see [Multi Guide node](#multi-guide-node)), **Minimax H3 V2V Temporal Window & Spatial Tiles OLD** (the 1.4.0 V2V node, kept for saved workflows), and **Minimax H3 Long Generation**, for long text-to-video and image-to-video without a reference video, with a prompt timeline so the story moves forward. See [Long Generation node](#long-generation-node-text--image-to-video). Nothing inside the model is patched: every window and tile is an ordinary native H3 run. With one window and no tiles, the output is bit-identical to the plain native workflow.
 
 ## What's new
+
+**1.7.0** — new node: **Minimax H3 Reference to Video HiRes**
+- The native Reference to Video node gives the model every reference video at about 1 MP (768 short edge), whatever your output size. The HiRes node is the same node with one extra setting, **`ref_video_size`**: `native` (default) = exactly the native node; **`match`** = at outputs above ~1 MP, the reference video reaches the model at your generation size (e.g. 1920x1088 instead of 1344x768). In a first 1920x1080 test it followed the input clearly more closely (edge match 0.58 vs 0.50, about 9% sharper, no offset). See [Reference to Video HiRes node](#reference-to-video-hires-node).
 
 **1.6.1** — fix: `prefix` carry stopped at window 2 with *"Expected all tensors to be on the same device, cuda:0 and cpu"* when the workflow had no noise mask of its own (seen with Long Generation; the V2V node is fixed too).
 
@@ -241,6 +244,22 @@ Each connected guide also shows an `until_step` (and each audio an `audio_until_
 - **N needs the model routed through this node** (`model` in → `model` out, on to the sampler or the next model node). The order does not matter: before or after the V2V / Long Generation node gives the same result. If a guide has an `until_step` and the model is not connected, the node stops with a clear message instead of ignoring it.
 - With windows, every window runs its own full schedule, so `until_step` counts within each window. With tiles (including `sync`), every tile follows the same rule.
 - Only guides from this node are released. A V2V window carry is never released.
+
+## Reference to Video HiRes node
+
+**Minimax H3 Reference to Video HiRes (mo-akkakk)** is ComfyUI's **MiniMax H3 Reference to Video** with one extra setting. Use it in place of the native node, with the same inputs.
+
+| `ref_video_size` | What the model gets |
+|---|---|
+| `native` (default) | Exactly the native node: reference videos at a 768-short-edge canvas (about 1 MP), whatever your output size. |
+| `match` | Above ~1 MP: each reference video at your generation's pixel area (keeping its aspect), e.g. 1920x1088 at a 1920x1088 output instead of 1344x768. At 1 MP or below it equals `native`. A source smaller than that is never upscaled. |
+
+- **Why:** at 2 MP and up, the native node makes the model follow a reference with less than half the output's pixels. With `match` it sees the full detail: in a first 1920x1080 test the result followed the input more closely everywhere in the frame (edge match 0.58 vs 0.50), about 9% sharper, with no offset.
+- **Cost:** more reference tokens in every step of every window, so it is slower and uses more memory. Worth it when you follow a reference video closely at 2 MP and up; without tiles especially (with tiles, the V2V node's `plate` input already gives each tile full detail).
+- **Only the model's reference changes.** The text encoder (Qwen) sees the video exactly as in the native node, so prompts behave the same. Reference images are untouched: with `ref_image_size` = `match` they already reach the model at your generation size.
+- Each reference video is encoded once, directly at the larger size. The console shows *"reference video 1 given to the model at 1920x1088"* when it is active. Needs `vae` (without it, it behaves like the native node).
+- It runs the native node underneath, so ComfyUI's own updates to Reference to Video reach it automatically.
+- H3's reference pipeline normally uses ~1 MP reference videos, so larger ones are new ground: compare `native` and `match` on your shots.
 
 ## Long Generation node (text / image to video)
 
